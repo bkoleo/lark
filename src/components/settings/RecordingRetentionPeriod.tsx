@@ -34,6 +34,10 @@ export const RecordingRetentionPeriodSelector: React.FC<RecordingRetentionPeriod
           count: Number(historyLimit),
         }),
       },
+      {
+        value: "audio_day1",
+        label: t("settings.debug.recordingRetention.audioDay1"),
+      },
       { value: "days3", label: t("settings.debug.recordingRetention.days3") },
       { value: "weeks2", label: t("settings.debug.recordingRetention.weeks2") },
       {

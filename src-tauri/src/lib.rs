@@ -155,6 +155,8 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     );
     let history_manager =
         Arc::new(HistoryManager::new(app_handle).expect("Failed to initialize history manager"));
+    #[cfg(target_os = "macos")]
+    let meeting_manager = Arc::new(managers::meeting::MeetingManager::new(app_handle));
 
     // Apply accelerator preferences before any model loads
     managers::transcription::apply_accelerator_settings(app_handle);
@@ -164,6 +166,11 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     app_handle.manage(model_manager.clone());
     app_handle.manage(transcription_manager.clone());
     app_handle.manage(history_manager.clone());
+    #[cfg(target_os = "macos")]
+    {
+        app_handle.manage(meeting_manager);
+        managers::meeting_detect::spawn_meeting_detector(app_handle);
+    }
 
     // Note: Shortcuts are NOT initialized here.
     // The frontend is responsible for calling the `initialize_shortcuts` command
@@ -234,6 +241,20 @@ fn initialize_core_logic(app_handle: &AppHandle) {
 
                 // Use centralized cancellation that handles all operations
                 cancel_current_operation(app);
+            }
+            #[cfg(target_os = "macos")]
+            "meeting_toggle" => {
+                let app_clone = app.clone();
+                // Off the menu-event thread: starting/stopping opens audio
+                // devices and can block for a moment.
+                std::thread::spawn(move || {
+                    let meeting_manager = app_clone
+                        .state::<Arc<managers::meeting::MeetingManager>>()
+                        .inner()
+                        .clone();
+                    meeting_manager.toggle();
+                    tray::update_tray_menu(&app_clone, &tray::TrayIconState::Idle, None);
+                });
             }
             "quit" => {
                 app.exit(0);
@@ -492,8 +513,8 @@ pub fn run(cli_args: CliArgs) {
             }
         }))
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_macos_permissions::init())
@@ -512,7 +533,7 @@ pub fn run(cli_args: CliArgs) {
             // for portable mode (redirects WebView2 cache to portable Data dir)
             let mut win_builder =
                 tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("/".into()))
-                    .title("Handy")
+                    .title("Lark")
                     .inner_size(680.0, 570.0)
                     .min_inner_size(680.0, 570.0)
                     .resizable(true)

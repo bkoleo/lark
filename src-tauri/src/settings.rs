@@ -158,6 +158,9 @@ pub enum AutoSubmitKey {
 pub enum RecordingRetentionPeriod {
     Never,
     PreserveLimit,
+    /// Lark: delete only the audio file after 24h; the transcript stays in
+    /// history forever.
+    AudioDay1,
     Days3,
     Weeks2,
     Months3,
@@ -187,11 +190,8 @@ impl Default for ModelUnloadTimeout {
 
 impl Default for PasteMethod {
     fn default() -> Self {
-        // Default to CtrlV for macOS and Windows, Direct for Linux
-        #[cfg(target_os = "linux")]
-        return PasteMethod::Direct;
-        #[cfg(not(target_os = "linux"))]
-        return PasteMethod::CtrlV;
+        // Lark: direct typing on every platform — no clipboard round-trip.
+        PasteMethod::Direct
     }
 }
 
@@ -365,6 +365,10 @@ pub struct AppSettings {
     pub selected_language: String,
     #[serde(default = "default_overlay_position")]
     pub overlay_position: OverlayPosition,
+    /// User-dragged overlay position as a logical offset from the monitor's
+    /// top-left corner. None = use the overlay_position preset.
+    #[serde(default)]
+    pub overlay_custom_offset: Option<(f64, f64)>,
     #[serde(default = "default_debug_mode")]
     pub debug_mode: bool,
     #[serde(default = "default_log_level")]
@@ -453,7 +457,9 @@ fn default_autostart_enabled() -> bool {
 }
 
 fn default_update_checks_enabled() -> bool {
-    true
+    // Lark fork: upstream update endpoints are removed from tauri.conf.json,
+    // so update checks would only ever fail — keep them off.
+    false
 }
 
 fn default_selected_language() -> String {
@@ -766,8 +772,8 @@ pub fn get_default_settings() -> AppSettings {
 
     AppSettings {
         bindings,
-        push_to_talk: true,
-        audio_feedback: false,
+        push_to_talk: false,
+        audio_feedback: true,
         audio_feedback_volume: default_audio_feedback_volume(),
         sound_theme: default_sound_theme(),
         start_hidden: default_start_hidden(),
@@ -781,6 +787,7 @@ pub fn get_default_settings() -> AppSettings {
         translate_to_english: false,
         selected_language: "auto".to_string(),
         overlay_position: default_overlay_position(),
+        overlay_custom_offset: None,
         debug_mode: false,
         log_level: default_log_level(),
         custom_words: Vec::new(),

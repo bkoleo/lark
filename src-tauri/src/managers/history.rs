@@ -340,11 +340,53 @@ impl HistoryManager {
                 let limit = crate::settings::get_history_limit(&self.app_handle);
                 return self.cleanup_by_count(limit);
             }
+            crate::settings::RecordingRetentionPeriod::AudioDay1 => {
+                // Delete only audio older than 24h; transcripts are kept.
+                return self.cleanup_audio_only(24 * 60 * 60);
+            }
             _ => {
                 // Use time-based logic
                 return self.cleanup_by_time(retention_period);
             }
         }
+    }
+
+    /// Deletes WAV files older than `max_age_secs` while keeping their
+    /// transcript rows (file_name is blanked so the UI stops offering
+    /// playback). Saved/pinned entries keep their audio.
+    fn cleanup_audio_only(&self, max_age_secs: i64) -> Result<()> {
+        let conn = self.get_connection()?;
+        let cutoff = Utc::now().timestamp() - max_age_secs;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, file_name FROM transcription_history
+             WHERE saved = 0 AND timestamp < ?1 AND file_name != ''",
+        )?;
+        let rows = stmt.query_map(params![cutoff], |row| {
+            Ok((row.get::<_, i64>("id")?, row.get::<_, String>("file_name")?))
+        })?;
+        let entries: Vec<(i64, String)> = rows.collect::<std::result::Result<_, _>>()?;
+
+        let mut purged = 0;
+        for (id, file_name) in entries {
+            let file_path = self.recordings_dir.join(&file_name);
+            if file_path.exists() {
+                if let Err(e) = fs::remove_file(&file_path) {
+                    error!("Failed to delete WAV file {}: {}", file_name, e);
+                    continue;
+                }
+            }
+            conn.execute(
+                "UPDATE transcription_history SET file_name = '' WHERE id = ?1",
+                params![id],
+            )?;
+            purged += 1;
+        }
+
+        if purged > 0 {
+            debug!("Purged audio from {} history entries older than 24h", purged);
+        }
+        Ok(())
     }
 
     fn delete_entries_and_files(&self, entries: &[(i64, String)]) -> Result<usize> {

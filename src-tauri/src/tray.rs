@@ -87,9 +87,9 @@ pub fn tray_tooltip() -> String {
 
 fn version_label() -> String {
     if cfg!(debug_assertions) {
-        format!("Handy v{} (Dev)", env!("CARGO_PKG_VERSION"))
+        format!("Lark v{} (Dev)", env!("CARGO_PKG_VERSION"))
     } else {
-        format!("Handy v{}", env!("CARGO_PKG_VERSION"))
+        format!("Lark v{}", env!("CARGO_PKG_VERSION"))
     }
 }
 
@@ -137,6 +137,22 @@ pub fn update_tray_menu(app: &AppHandle, state: &TrayIconState, locale: Option<&
     let quit_i = MenuItem::with_id(app, "quit", &strings.quit, true, quit_accelerator)
         .expect("failed to create quit item");
     let separator = || PredefinedMenuItem::separator(app).expect("failed to create separator");
+
+    #[cfg(target_os = "macos")]
+    let meeting_i = {
+        use crate::managers::meeting::{MeetingManager, MeetingStatus};
+        let status = app
+            .try_state::<Arc<MeetingManager>>()
+            .map(|m| m.status())
+            .unwrap_or(MeetingStatus::Idle);
+        let (label, enabled) = match status {
+            MeetingStatus::Idle => (&strings.meeting_start, true),
+            MeetingStatus::Recording => (&strings.meeting_stop, true),
+            MeetingStatus::Processing => (&strings.meeting_processing, false),
+        };
+        MenuItem::with_id(app, "meeting_toggle", label, enabled, None::<&str>)
+            .expect("failed to create meeting item")
+    };
 
     // Build model submenu — label is the active model name
     let model_manager = app.state::<Arc<ModelManager>>();
@@ -189,6 +205,8 @@ pub fn update_tray_menu(app: &AppHandle, state: &TrayIconState, locale: Option<&
                     &cancel_i,
                     &separator(),
                     &copy_last_transcript_i,
+                    #[cfg(target_os = "macos")]
+                    &meeting_i,
                     &separator(),
                     &settings_i,
                     &check_updates_i,
@@ -204,6 +222,8 @@ pub fn update_tray_menu(app: &AppHandle, state: &TrayIconState, locale: Option<&
                 &version_i,
                 &separator(),
                 &copy_last_transcript_i,
+                #[cfg(target_os = "macos")]
+                &meeting_i,
                 &separator(),
                 &model_submenu,
                 &unload_model_i,

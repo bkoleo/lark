@@ -36,6 +36,7 @@ pub struct AudioRecorder {
     worker_handle: Option<std::thread::JoinHandle<()>>,
     vad: Option<Arc<Mutex<Box<dyn vad::VoiceActivityDetector>>>>,
     level_cb: Option<Arc<dyn Fn(Vec<f32>) + Send + Sync + 'static>>,
+    flow_cb: Option<Arc<dyn Fn(f32) + Send + Sync + 'static>>,
 }
 
 impl AudioRecorder {
@@ -46,6 +47,7 @@ impl AudioRecorder {
             worker_handle: None,
             vad: None,
             level_cb: None,
+            flow_cb: None,
         })
     }
 
@@ -60,6 +62,22 @@ impl AudioRecorder {
     {
         self.level_cb = Some(Arc::new(cb));
         self
+    }
+
+    /// Called with the RMS of every raw chunk delivered by the device, before
+    /// VAD filtering. Lets callers distinguish a live microphone from one that
+    /// is streaming pure digital silence (e.g. a Bluetooth mic whose handshake
+    /// failed) — both look identical at the stream level.
+    pub fn with_flow_callback<F>(mut self, cb: F) -> Self
+    where
+        F: Fn(f32) + Send + Sync + 'static,
+    {
+        self.flow_cb = Some(Arc::new(cb));
+        self
+    }
+
+    pub fn device_name(&self) -> Option<String> {
+        self.device.as_ref().and_then(|d| d.name().ok())
     }
 
     pub fn open(&mut self, device: Option<Device>) -> Result<(), Box<dyn std::error::Error>> {
@@ -81,8 +99,9 @@ impl AudioRecorder {
 
         let thread_device = device.clone();
         let vad = self.vad.clone();
-        // Move the optional level callback into the worker thread
+        // Move the optional callbacks into the worker thread
         let level_cb = self.level_cb.clone();
+        let flow_cb = self.flow_cb.clone();
 
         let worker = std::thread::spawn(move || {
             let stop_flag = Arc::new(AtomicBool::new(false));
@@ -159,7 +178,9 @@ impl AudioRecorder {
                 Ok((stream, sample_rate)) => {
                     let _ = init_tx.send(Ok(()));
                     // Keep the stream alive while we process samples.
-                    run_consumer(sample_rate, vad, sample_rx, cmd_rx, level_cb, stop_flag);
+                    run_consumer(
+                        sample_rate, vad, sample_rx, cmd_rx, level_cb, flow_cb, stop_flag,
+                    );
                     drop(stream);
                 }
                 Err(error_message) => {
@@ -398,6 +419,7 @@ fn run_consumer(
     sample_rx: mpsc::Receiver<AudioChunk>,
     cmd_rx: mpsc::Receiver<Cmd>,
     level_cb: Option<Arc<dyn Fn(Vec<f32>) + Send + Sync + 'static>>,
+    flow_cb: Option<Arc<dyn Fn(f32) + Send + Sync + 'static>>,
     stop_flag: Arc<AtomicBool>,
 ) {
     let mut frame_resampler = FrameResampler::new(
@@ -451,6 +473,14 @@ fn run_consumer(
             AudioChunk::Samples(s) => s,
             AudioChunk::EndOfStream => continue,
         };
+
+        // ---------- raw energy reporting ---------------------------------- //
+        if let Some(cb) = &flow_cb {
+            if !raw.is_empty() {
+                let energy: f32 = raw.iter().map(|s| s * s).sum();
+                cb((energy / raw.len() as f32).sqrt());
+            }
+        }
 
         // ---------- spectrum processing ---------------------------------- //
         if let Some(buckets) = visualizer.feed(&raw) {

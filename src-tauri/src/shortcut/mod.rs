@@ -548,6 +548,8 @@ pub fn change_overlay_position_setting(app: AppHandle, position: String) -> Resu
         }
     };
     settings.overlay_position = parsed;
+    // Choosing a preset acts as "reset position" — discard any dragged offset.
+    settings.overlay_custom_offset = None;
     settings::write_settings(&app, settings);
 
     // Update overlay position without recreating window

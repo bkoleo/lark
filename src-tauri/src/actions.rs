@@ -13,7 +13,7 @@ use crate::utils::{
 };
 use crate::TranscriptionCoordinator;
 use ferrous_opencc::{config::BuiltinConfig, OpenCC};
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,6 +25,121 @@ use tauri::{AppHandle, Emitter};
 struct RecordingErrorEvent {
     error_type: String,
     detail: Option<String>,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct MicStatusEvent {
+    status: String, // "connecting" | "live" | "silent"
+    device: Option<String>,
+}
+
+/// How long a freshly started recording may stay silent before we alert the
+/// user. Bluetooth mics legitimately need 1-2s to negotiate; beyond this the
+/// handshake has almost certainly failed and the recording is capturing nothing.
+const AUDIO_FLOW_TIMEOUT_MS: u64 = 2500;
+
+/// Watches a just-started recording and keeps the user's feedback honest:
+/// the start chime only plays once the microphone delivers real audio, and a
+/// silent mic triggers an audible alert plus an overlay warning instead of a
+/// false "recording" signal.
+fn spawn_mic_flow_watchdog(app: &AppHandle, rm: &Arc<AudioRecordingManager>, binding_id: &str) {
+    let app = app.clone();
+    let rm = Arc::clone(rm);
+    let binding_id = binding_id.to_string();
+    std::thread::spawn(move || {
+        let _ = app.emit(
+            "mic-status",
+            MicStatusEvent {
+                status: "connecting".to_string(),
+                device: rm.current_device_name(),
+            },
+        );
+
+        let confirm_live = |rm: &Arc<AudioRecordingManager>| {
+            let _ = app.emit(
+                "mic-status",
+                MicStatusEvent {
+                    status: "live".to_string(),
+                    device: rm.current_device_name(),
+                },
+            );
+            play_feedback_sound_blocking(&app, SoundType::Start);
+            rm.apply_mute();
+        };
+
+        // Returns Some(true) if audio flowed, Some(false) on timeout,
+        // None if the recording ended while waiting.
+        let wait_for_flow = |rm: &Arc<AudioRecordingManager>| {
+            let deadline =
+                Instant::now() + std::time::Duration::from_millis(AUDIO_FLOW_TIMEOUT_MS);
+            while Instant::now() < deadline {
+                if !rm.is_recording() {
+                    return None;
+                }
+                if rm.audio_is_flowing() {
+                    return Some(true);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Some(false)
+        };
+
+        match wait_for_flow(&rm) {
+            None => return,
+            Some(true) => {
+                confirm_live(&rm);
+                return;
+            }
+            Some(false) => {}
+        }
+
+        // Silent stream — almost always a failed Bluetooth handshake. Restart
+        // the stream automatically (what tapping twice used to do by hand)
+        // before bothering the user.
+        warn!(
+            "No audio from microphone {:?} within {}ms — restarting stream",
+            rm.current_device_name(),
+            AUDIO_FLOW_TIMEOUT_MS
+        );
+        if rm.restart_silent_stream(&binding_id) {
+            match wait_for_flow(&rm) {
+                None => return,
+                Some(true) => {
+                    info!("Microphone stream recovered after restart");
+                    confirm_live(&rm);
+                    return;
+                }
+                Some(false) => {}
+            }
+        }
+
+        let device = rm.current_device_name();
+        warn!("Microphone {:?} still silent after restart — alerting user", device);
+        let _ = app.emit(
+            "mic-status",
+            MicStatusEvent {
+                status: "silent".to_string(),
+                device,
+            },
+        );
+        // Distinct error cue: a double stop-tone instead of the start chime.
+        play_feedback_sound_blocking(&app, SoundType::Stop);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        play_feedback_sound_blocking(&app, SoundType::Stop);
+
+        // If audio somehow starts flowing later, upgrade to live so the user
+        // knows it recovered.
+        loop {
+            if !rm.is_recording() {
+                return;
+            }
+            if rm.audio_is_flowing() {
+                confirm_live(&rm);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
 }
 
 /// Drop guard that notifies the [`TranscriptionCoordinator`] when the
@@ -413,47 +528,21 @@ impl ShortcutAction for TranscribeAction {
         let is_always_on = settings.always_on_microphone;
         debug!("Microphone mode - always_on: {}", is_always_on);
 
+        // Both modes: start recording, then let the flow watchdog confirm real
+        // audio is arriving before playing the start chime (and apply mute
+        // after). A mic that streams digital silence — e.g. a failed Bluetooth
+        // handshake — triggers an audible alert instead of a false chime.
+        debug!("Starting recording; chime deferred until audio flow is confirmed");
         let mut recording_error: Option<String> = None;
-        if is_always_on {
-            // Always-on mode: Play audio feedback immediately, then apply mute after sound finishes
-            debug!("Always-on mode: Playing audio feedback immediately");
-            let rm_clone = Arc::clone(&rm);
-            let app_clone = app.clone();
-            // The blocking helper exits immediately if audio feedback is disabled,
-            // so we can always reuse this thread to ensure mute happens right after playback.
-            std::thread::spawn(move || {
-                play_feedback_sound_blocking(&app_clone, SoundType::Start);
-                rm_clone.apply_mute();
-            });
-
-            if let Err(e) = rm.try_start_recording(&binding_id) {
-                debug!("Recording failed: {}", e);
-                recording_error = Some(e);
+        let recording_start_time = Instant::now();
+        match rm.try_start_recording(&binding_id) {
+            Ok(()) => {
+                debug!("Recording started in {:?}", recording_start_time.elapsed());
+                spawn_mic_flow_watchdog(app, &rm, &binding_id);
             }
-        } else {
-            // On-demand mode: Start recording first, then play audio feedback, then apply mute
-            // This allows the microphone to be activated before playing the sound
-            debug!("On-demand mode: Starting recording first, then audio feedback");
-            let recording_start_time = Instant::now();
-            match rm.try_start_recording(&binding_id) {
-                Ok(()) => {
-                    debug!("Recording started in {:?}", recording_start_time.elapsed());
-                    // Small delay to ensure microphone stream is active
-                    let app_clone = app.clone();
-                    let rm_clone = Arc::clone(&rm);
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        debug!("Handling delayed audio feedback/mute sequence");
-                        // Helper handles disabled audio feedback by returning early, so we reuse it
-                        // to keep mute sequencing consistent in every mode.
-                        play_feedback_sound_blocking(&app_clone, SoundType::Start);
-                        rm_clone.apply_mute();
-                    });
-                }
-                Err(e) => {
-                    debug!("Failed to start recording: {}", e);
-                    recording_error = Some(e);
-                }
+            Err(e) => {
+                debug!("Failed to start recording: {}", e);
+                recording_error = Some(e);
             }
         }
 

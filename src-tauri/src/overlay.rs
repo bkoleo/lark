@@ -1,6 +1,9 @@
 use crate::input;
 use crate::settings;
 use crate::settings::OverlayPosition;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize};
 
 #[cfg(not(target_os = "macos"))]
@@ -31,8 +34,8 @@ tauri_panel! {
     })
 }
 
-const OVERLAY_WIDTH: f64 = 172.0;
-const OVERLAY_HEIGHT: f64 = 36.0;
+const OVERLAY_WIDTH: f64 = 200.0;
+const OVERLAY_HEIGHT: f64 = 52.0;
 
 #[cfg(target_os = "macos")]
 const OVERLAY_TOP_OFFSET: f64 = 46.0;
@@ -44,6 +47,8 @@ const OVERLAY_BOTTOM_OFFSET: f64 = 15.0;
 
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 const OVERLAY_BOTTOM_OFFSET: f64 = 40.0;
+
+const OVERLAY_LEFT_OFFSET: f64 = 16.0;
 
 #[cfg(target_os = "linux")]
 fn update_gtk_layer_shell_anchors(overlay_window: &tauri::webview::WebviewWindow) {
@@ -210,7 +215,17 @@ fn calculate_overlay_position(app_handle: &AppHandle) -> Option<(f64, f64)> {
 
     let settings = settings::get_settings(app_handle);
 
-    let x = monitor_x + (monitor_width - OVERLAY_WIDTH) / 2.0;
+    // A user-dragged position wins over the preset. The offset is relative to
+    // the monitor's top-left corner so it survives monitor changes; clamp it
+    // so the overlay can never end up off-screen.
+    if let Some((ox, oy)) = settings.overlay_custom_offset {
+        let x = (monitor_x + ox).clamp(monitor_x, monitor_x + monitor_width - OVERLAY_WIDTH);
+        let y = (monitor_y + oy).clamp(monitor_y, monitor_y + monitor_height - OVERLAY_HEIGHT);
+        return Some((x, y));
+    }
+
+    // Lark default: bottom-left, out of the way of centered app content.
+    let x = monitor_x + OVERLAY_LEFT_OFFSET;
     let y = match settings.overlay_position {
         OverlayPosition::Top => monitor_y + OVERLAY_TOP_OFFSET,
         OverlayPosition::Bottom | OverlayPosition::None => {
@@ -219,6 +234,54 @@ fn calculate_overlay_position(app_handle: &AppHandle) -> Option<(f64, f64)> {
     };
 
     Some((x, y))
+}
+
+/// Set whenever Lark itself repositions the overlay, so the Moved listener can
+/// tell programmatic moves apart from the user dragging the pill.
+static LAST_PROGRAMMATIC_MOVE: Mutex<Option<Instant>> = Mutex::new(None);
+static DRAG_SAVE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Watches the overlay window for user drags and persists the dropped
+/// position (debounced) as a monitor-relative logical offset.
+fn attach_overlay_drag_tracking(app_handle: &AppHandle) {
+    let Some(window) = app_handle.get_webview_window("recording_overlay") else {
+        return;
+    };
+    let app = app_handle.clone();
+    let win = window.clone();
+    window.on_window_event(move |event| {
+        let tauri::WindowEvent::Moved(pos) = event else {
+            return;
+        };
+        // Ignore moves Lark made itself (repositioning before show).
+        if let Some(t) = *LAST_PROGRAMMATIC_MOVE.lock().unwrap() {
+            if t.elapsed() < std::time::Duration::from_millis(600) {
+                return;
+            }
+        }
+        let pos = *pos;
+        let gen = DRAG_SAVE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        let app = app.clone();
+        let win = win.clone();
+        // Debounce: drags fire a stream of Moved events; save only after the
+        // window has been still for a moment.
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            if DRAG_SAVE_GENERATION.load(Ordering::SeqCst) != gen {
+                return;
+            }
+            let Ok(Some(monitor)) = win.current_monitor() else {
+                return;
+            };
+            let scale = monitor.scale_factor();
+            let ox = pos.x as f64 / scale - monitor.position().x as f64 / scale;
+            let oy = pos.y as f64 / scale - monitor.position().y as f64 / scale;
+            let mut settings = settings::get_settings(&app);
+            settings.overlay_custom_offset = Some((ox, oy));
+            settings::write_settings(&app, settings);
+            log::debug!("Saved overlay custom offset: ({ox:.0}, {oy:.0})");
+        });
+    });
 }
 
 /// Creates the recording overlay window and keeps it hidden by default
@@ -274,6 +337,7 @@ pub fn create_recording_overlay(app_handle: &AppHandle) {
                 }
             }
 
+            attach_overlay_drag_tracking(app_handle);
             debug!("Recording overlay window created successfully (hidden)");
         }
         Err(e) => {
@@ -301,7 +365,14 @@ pub fn create_recording_overlay(app_handle: &AppHandle) {
             .transparent(true)
             .no_activate(true)
             .corner_radius(0.0)
-            .with_window(|w| w.decorations(false).transparent(true))
+            .with_window(|w| {
+                // Pin to dark so the HUD glass stays dark even when the
+                // system is in light mode (HudWindow material follows the
+                // window's appearance, not the CSS).
+                w.decorations(false)
+                    .transparent(true)
+                    .theme(Some(tauri::Theme::Dark))
+            })
             .collection_behavior(
                 CollectionBehavior::new()
                     .can_join_all_spaces()
@@ -311,6 +382,18 @@ pub fn create_recording_overlay(app_handle: &AppHandle) {
         {
             Ok(panel) => {
                 let _ = panel.hide();
+                // Native macOS glass: real background blur behind the pill,
+                // matching the system HUD material. CSS backdrop-filter can't
+                // do this — it only blurs the webview's own content.
+                if let Some(win) = app_handle.get_webview_window("recording_overlay") {
+                    use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
+                    if let Err(e) =
+                        apply_vibrancy(&win, NSVisualEffectMaterial::HudWindow, None, Some(26.0))
+                    {
+                        log::warn!("Failed to apply overlay vibrancy: {e}");
+                    }
+                }
+                attach_overlay_drag_tracking(app_handle);
             }
             Err(e) => {
                 log::error!("Failed to create recording overlay panel: {}", e);
@@ -363,6 +446,7 @@ pub fn update_overlay_position(app_handle: &AppHandle) {
         }
 
         if let Some((x, y)) = calculate_overlay_position(app_handle) {
+            *LAST_PROGRAMMATIC_MOVE.lock().unwrap() = Some(Instant::now());
             let _ = overlay_window
                 .set_position(tauri::Position::Logical(tauri::LogicalPosition { x, y }));
         }

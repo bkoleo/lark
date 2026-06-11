@@ -3,7 +3,7 @@ use crate::helpers::clamshell;
 use crate::settings::{get_settings, AppSettings};
 use crate::utils;
 use log::{debug, error, info};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::Manager;
@@ -117,9 +117,15 @@ pub enum MicrophoneMode {
 
 /* ──────────────────────────────────────────────────────────────── */
 
+// RMS below this is treated as digital silence. A real microphone's noise
+// floor sits orders of magnitude above it; a Bluetooth mic whose handshake
+// failed delivers exact zeros.
+const AUDIO_FLOW_RMS_THRESHOLD: f32 = 1e-6;
+
 fn create_audio_recorder(
     vad_path: &str,
     app_handle: &tauri::AppHandle,
+    audio_flowing: Arc<AtomicBool>,
 ) -> Result<AudioRecorder, anyhow::Error> {
     let silero = SileroVad::new(vad_path, 0.3)
         .map_err(|e| anyhow::anyhow!("Failed to create SileroVad: {}", e))?;
@@ -134,6 +140,11 @@ fn create_audio_recorder(
             let app_handle = app_handle.clone();
             move |levels| {
                 utils::emit_levels(&app_handle, &levels);
+            }
+        })
+        .with_flow_callback(move |rms| {
+            if rms > AUDIO_FLOW_RMS_THRESHOLD {
+                audio_flowing.store(true, Ordering::Relaxed);
             }
         });
 
@@ -153,6 +164,8 @@ pub struct AudioRecordingManager {
     is_recording: Arc<Mutex<bool>>,
     did_mute: Arc<Mutex<bool>>,
     close_generation: Arc<AtomicU64>,
+    audio_flowing: Arc<AtomicBool>,
+    device_name: Arc<Mutex<Option<String>>>,
 }
 
 impl AudioRecordingManager {
@@ -176,6 +189,8 @@ impl AudioRecordingManager {
             is_recording: Arc::new(Mutex::new(false)),
             did_mute: Arc::new(Mutex::new(false)),
             close_generation: Arc::new(AtomicU64::new(0)),
+            audio_flowing: Arc::new(AtomicBool::new(false)),
+            device_name: Arc::new(Mutex::new(None)),
         };
 
         // Always-on?  Open immediately.
@@ -277,6 +292,7 @@ impl AudioRecordingManager {
             *recorder_opt = Some(create_audio_recorder(
                 vad_path.to_str().unwrap(),
                 &self.app_handle,
+                self.audio_flowing.clone(),
             )?);
         }
         Ok(())
@@ -318,6 +334,7 @@ impl AudioRecordingManager {
         if let Some(rec) = recorder_opt.as_mut() {
             rec.open(selected_device)
                 .map_err(|e| anyhow::anyhow!("Failed to open recorder: {}", e))?;
+            *self.device_name.lock().unwrap() = rec.device_name();
         }
 
         *open_flag = true;
@@ -400,6 +417,9 @@ impl AudioRecordingManager {
 
             if let Some(rec) = self.recorder.lock().unwrap().as_ref() {
                 if rec.start().is_ok() {
+                    // Re-arm the flow detector for this recording; the device's
+                    // own chunks will set it again within a buffer period.
+                    self.audio_flowing.store(false, Ordering::Relaxed);
                     *self.is_recording.lock().unwrap() = true;
                     *state = RecordingState::Recording {
                         binding_id: binding_id.to_string(),
@@ -487,6 +507,53 @@ impl AudioRecordingManager {
             *self.state.lock().unwrap(),
             RecordingState::Recording { .. }
         )
+    }
+
+    /// True once the open stream has delivered at least one chunk with real
+    /// energy since recording started (as opposed to digital silence).
+    pub fn audio_is_flowing(&self) -> bool {
+        self.audio_flowing.load(Ordering::Relaxed)
+    }
+
+    /// Tears down and reopens a stream that is delivering digital silence
+    /// (failed Bluetooth handshake) while keeping the logical recording
+    /// session alive — the automated version of "tap twice and it works".
+    /// Returns true if the replacement stream started.
+    pub fn restart_silent_stream(&self, binding_id: &str) -> bool {
+        {
+            let state = self.state.lock().unwrap();
+            match *state {
+                RecordingState::Recording {
+                    binding_id: ref active,
+                } if active == binding_id => {}
+                _ => return false,
+            }
+        }
+
+        info!("Restarting silent microphone stream for binding {binding_id}");
+        // Discard whatever the dead stream captured (silence) and close it.
+        if let Some(rec) = self.recorder.lock().unwrap().as_ref() {
+            let _ = rec.stop();
+        }
+        self.stop_microphone_stream();
+
+        if let Err(e) = self.start_microphone_stream() {
+            error!("Failed to reopen microphone stream: {e}");
+            return false;
+        }
+        if let Some(rec) = self.recorder.lock().unwrap().as_ref() {
+            if rec.start().is_ok() {
+                self.audio_flowing.store(false, Ordering::Relaxed);
+                *self.is_recording.lock().unwrap() = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Name of the input device backing the current/most recent stream.
+    pub fn current_device_name(&self) -> Option<String> {
+        self.device_name.lock().unwrap().clone()
     }
 
     /// Cancel any ongoing recording without returning audio samples

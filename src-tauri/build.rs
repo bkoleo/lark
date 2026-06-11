@@ -144,10 +144,10 @@ fn build_apple_intelligence_bridge() {
         .to_string()
     });
 
-    // Check if the SDK supports FoundationModels (required for Apple Intelligence)
-    let framework_path =
-        Path::new(&sdk_path).join("System/Library/Frameworks/FoundationModels.framework");
-    let has_foundation_models = framework_path.exists();
+    // Lark fork: always build the stub. Apple Intelligence post-processing is
+    // intentionally excluded — the FoundationModels macros require a full Xcode
+    // install to compile, and the feature is too heavy for the target machine.
+    let has_foundation_models = false;
 
     let source_file = if has_foundation_models {
         println!("cargo:warning=Building with Apple Intelligence support.");

@@ -1,15 +1,62 @@
 .recording-overlay {
-  height: 36px;
-  width: 172px;
-  display: grid;
-  grid-template-columns: auto 1fr auto;
-  align-items: center;
-  padding: 6px;
-  background: #000000cc;
-  border-radius: 18px;
+  height: 52px;
+  width: 200px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 5px 8px;
+  /* Glass: real blur comes from the native NSVisualEffectView behind the
+     webview; this is just a translucent tint and hairline on top of it. */
+  background: rgba(30, 30, 34, 0.38);
+  border: 0.5px solid rgba(255, 255, 255, 0.18);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.22);
+  /* Capsule: half the 52px height, matching Apple's Liquid Glass pills */
+  border-radius: 26px;
   opacity: 0;
-  transition: opacity 300ms ease-out;
+  transition:
+    opacity 300ms ease-out,
+    background 300ms ease-out;
   box-sizing: border-box;
+  cursor: grab;
+}
+
+.recording-overlay:active {
+  cursor: grabbing;
+}
+
+.recording-overlay.mic-silent {
+  background: rgba(110, 16, 16, 0.55);
+}
+
+.overlay-main {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 26px;
+}
+
+.mic-status-line {
+  margin-top: 4px;
+  font-size: 9px;
+  line-height: 12px;
+  text-align: center;
+  color: #ffffff8c;
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mic-status-line.connecting {
+  animation: transcribing-pulse 1.2s infinite ease-in-out;
+}
+
+.mic-status-line.silent {
+  color: #ff7a7a;
+  font-weight: 600;
+  animation: transcribing-pulse 0.8s infinite ease-in-out;
 }
 
 .overlay-left {
@@ -24,9 +71,12 @@
 }
 
 .overlay-right {
+  position: absolute;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
   display: flex;
   align-items: center;
-  justify-content: flex-end;
 }
 
 .bars-container {
@@ -71,18 +121,30 @@
 }
 
 .cancel-button {
-  width: 24px;
-  height: 24px;
+  width: 18px;
+  height: 18px;
   border-radius: 50%;
   background: transparent;
+  color: rgba(255, 255, 255, 0.55);
+  opacity: 0.35;
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
   transition:
     background-color 150ms ease-out,
+    opacity 150ms ease-out,
     transform 100ms ease-out;
   flex-shrink: 0;
+}
+
+.cancel-button svg {
+  width: 9px;
+  height: 9px;
+}
+
+.cancel-button:hover {
+  opacity: 0.9;
 }
 
 .cancel-button:hover {
