@@ -341,6 +341,7 @@ impl MeetingManager {
             }
         }
         entries.sort_by_key(|(start, _, _)| *start);
+        let entries = drop_mic_bleed(entries);
 
         let duration_secs = mic_samples.len().max(sys_samples.len()) / SAMPLE_RATE;
         let mut md = String::new();
@@ -398,6 +399,100 @@ impl MeetingManager {
 /// Truncate or zero-pad to the expected wall-clock sample count.
 fn fit_to_length(samples: &mut Vec<f32>, expected: usize) {
     samples.resize(expected, 0.0);
+}
+
+/// Without headphones the mic also hears the call audio from the speakers,
+/// so the far side shows up on both tracks. The system tap is the
+/// authoritative copy — drop mic entries that near-duplicate a system
+/// entry close in time.
+fn drop_mic_bleed(
+    entries: Vec<(usize, &'static str, String)>,
+) -> Vec<(usize, &'static str, String)> {
+    const BLEED_WINDOW: i64 = (8 * SAMPLE_RATE) as i64;
+    entries
+        .iter()
+        .filter(|(start, speaker, text)| {
+            *speaker != "Kole"
+                || !entries.iter().any(|(s2, sp2, t2)| {
+                    *sp2 == "Them"
+                        && (*start as i64 - *s2 as i64).abs() < BLEED_WINDOW
+                        && strsim::normalized_levenshtein(text, t2) > 0.75
+                })
+        })
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(secs: usize, speaker: &'static str, text: &str) -> (usize, &'static str, String) {
+        (secs * SAMPLE_RATE, speaker, text.to_string())
+    }
+
+    #[test]
+    fn drops_mic_copy_of_system_line_nearby() {
+        let out = drop_mic_bleed(vec![
+            entry(20, "Kole", "I think we should move the launch date to July"),
+            entry(20, "Them", "I think we should move the launch date to July."),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1, "Them");
+    }
+
+    #[test]
+    fn drops_mic_copy_with_minor_transcription_differences() {
+        let out = drop_mic_bleed(vec![
+            entry(28, "Kole", "The website copy needs a final review before we ship"),
+            entry(30, "Them", "The Win Side copy needs a final review before we shift."),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1, "Them");
+    }
+
+    #[test]
+    fn keeps_genuine_kole_speech() {
+        let out = drop_mic_bleed(vec![
+            entry(10, "Kole", "Let me check the budget spreadsheet first"),
+            entry(12, "Them", "Sure, take your time, no rush at all"),
+        ]);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn keeps_similar_text_far_apart_in_time() {
+        let out = drop_mic_bleed(vec![
+            entry(5, "Kole", "Let's confirm the budget by Friday"),
+            entry(60, "Them", "Let's confirm the budget by Friday."),
+        ]);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn never_drops_system_entries() {
+        let out = drop_mic_bleed(vec![
+            entry(20, "Them", "The same sentence twice somehow"),
+            entry(21, "Them", "The same sentence twice somehow"),
+        ]);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn segments_split_on_silence_and_respect_minimums() {
+        let mut samples = vec![0.0f32; 16 * SAMPLE_RATE];
+        // 2s of "speech" at t=3s and t=10s, separated by >1s silence
+        for region in [(3, 5), (10, 12)] {
+            for s in &mut samples[region.0 * SAMPLE_RATE..region.1 * SAMPLE_RATE] {
+                *s = 0.3;
+            }
+        }
+        let regions = segment_active_regions(&samples);
+        assert_eq!(regions.len(), 2);
+        // padded starts land just before the speech
+        assert!(regions[0].0 < 3 * SAMPLE_RATE);
+        assert!(regions[1].0 < 10 * SAMPLE_RATE && regions[1].0 > 8 * SAMPLE_RATE);
+    }
 }
 
 /// Energy-based speech segmentation: returns sample ranges containing

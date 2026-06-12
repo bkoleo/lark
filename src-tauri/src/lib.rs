@@ -508,6 +508,19 @@ pub fn run(cli_args: CliArgs) {
                 signal_handle::send_transcription_input(app, "transcribe_with_post_process", "CLI");
             } else if args.iter().any(|a| a == "--cancel") {
                 crate::utils::cancel_current_operation(app);
+            } else if args.iter().any(|a| a == "--toggle-meeting") {
+                #[cfg(target_os = "macos")]
+                {
+                    let meeting_manager = app
+                        .state::<Arc<managers::meeting::MeetingManager>>()
+                        .inner()
+                        .clone();
+                    let app_clone = app.clone();
+                    std::thread::spawn(move || {
+                        meeting_manager.toggle();
+                        tray::update_tray_menu(&app_clone, &tray::TrayIconState::Idle, None);
+                    });
+                }
             } else {
                 show_main_window(app);
             }
