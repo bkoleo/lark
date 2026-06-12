@@ -34,6 +34,10 @@ tauri_panel! {
     })
 }
 
+// The meeting card reuses RecordingOverlayPanel's class: identical config
+// (non-activating floating panel), and a second tauri_panel! invocation in
+// one module collides on the macro's generated imports.
+
 const OVERLAY_WIDTH: f64 = 200.0;
 const OVERLAY_HEIGHT: f64 = 52.0;
 
@@ -427,23 +431,94 @@ pub fn show_recording_overlay(app_handle: &AppHandle) {
     show_overlay_state(app_handle, "recording");
 }
 
-/// Shows the meeting-detected prompt in the overlay pill (Granola-style):
-/// "<app> call? [Record] [x]". kind is "start" (call began, offer to record)
-/// or "stop" (call ended while recording, offer to stop & transcribe).
+#[cfg(target_os = "macos")]
+const MEETING_CARD_WIDTH: f64 = 340.0;
+#[cfg(target_os = "macos")]
+const MEETING_CARD_HEIGHT: f64 = 84.0;
+
+/// Top-right corner of the monitor the cursor is on (Granola puts its
+/// meeting card there; Kole asked for the same).
+#[cfg(target_os = "macos")]
+fn meeting_card_position(app_handle: &AppHandle) -> Option<(f64, f64)> {
+    let monitor = get_monitor_with_cursor(app_handle)?;
+    let scale = monitor.scale_factor();
+    let x = monitor.position().x as f64 / scale + monitor.size().width as f64 / scale
+        - MEETING_CARD_WIDTH
+        - 12.0;
+    let y = monitor.position().y as f64 / scale + 42.0;
+    Some((x, y))
+}
+
+/// Creates the meeting-prompt card window (hidden until a meeting is
+/// detected). A separate window from the recording pill so the two never
+/// fight: the pill is the user-positioned dictation HUD, the card is a
+/// transient top-right ask.
+#[cfg(target_os = "macos")]
+pub fn create_meeting_prompt_window(app_handle: &AppHandle) {
+    let Some((x, y)) = meeting_card_position(app_handle) else {
+        return;
+    };
+    match PanelBuilder::<_, RecordingOverlayPanel>::new(app_handle, "meeting_prompt")
+        .url(WebviewUrl::App("src/meeting-prompt/index.html".into()))
+        .title("Meeting")
+        .position(tauri::Position::Logical(tauri::LogicalPosition { x, y }))
+        .level(PanelLevel::Status)
+        .size(tauri::Size::Logical(tauri::LogicalSize {
+            width: MEETING_CARD_WIDTH,
+            height: MEETING_CARD_HEIGHT,
+        }))
+        .has_shadow(false)
+        .transparent(true)
+        .no_activate(true)
+        .corner_radius(0.0)
+        .with_window(|w| w.decorations(false).transparent(true))
+        .collection_behavior(
+            CollectionBehavior::new()
+                .can_join_all_spaces()
+                .full_screen_auxiliary(),
+        )
+        .build()
+    {
+        Ok(panel) => {
+            let _ = panel.hide();
+        }
+        Err(e) => log::error!("Failed to create meeting prompt panel: {e}"),
+    }
+}
+
+/// Shows the Granola-style meeting card: "Meeting detected / <app> /
+/// [Record]". kind is "start" (call began, offer to record) or "stop"
+/// (call ended while recording, offer to stop & transcribe).
 #[cfg(target_os = "macos")]
 pub fn show_meeting_prompt(app_handle: &AppHandle, kind: &str, app_name: &str) {
-    let settings = settings::get_settings(app_handle);
-    if settings.overlay_position == OverlayPosition::None {
-        return;
-    }
-
-    update_overlay_position(app_handle);
-
-    if let Some(overlay_window) = app_handle.get_webview_window("recording_overlay") {
-        let _ = overlay_window.show();
-        let _ = overlay_window.emit(
+    if let Some(window) = app_handle.get_webview_window("meeting_prompt") {
+        if let Some((x, y)) = meeting_card_position(app_handle) {
+            let _ = window.set_position(tauri::Position::Logical(tauri::LogicalPosition { x, y }));
+        }
+        let _ = window.show();
+        let _ = window.emit(
             "meeting-prompt",
             serde_json::json!({ "kind": kind, "app": app_name }),
+        );
+    }
+}
+
+/// Hides the meeting card (after a button click or auto-dismiss).
+#[cfg(target_os = "macos")]
+pub fn hide_meeting_prompt(app_handle: &AppHandle) {
+    if let Some(window) = app_handle.get_webview_window("meeting_prompt") {
+        let _ = window.hide();
+    }
+}
+
+/// Tells the overlay how much audio is being transcribed and how long that
+/// is expected to take (from the learned machine speed), so it can show a
+/// progress ring and time-remaining instead of a bare spinner.
+pub fn emit_transcribing_info(app_handle: &AppHandle, audio_secs: u64, estimated_secs: u64) {
+    if let Some(overlay_window) = app_handle.get_webview_window("recording_overlay") {
+        let _ = overlay_window.emit(
+            "transcribing-info",
+            serde_json::json!({ "audioSecs": audio_secs, "estimatedSecs": estimated_secs }),
         );
     }
 }

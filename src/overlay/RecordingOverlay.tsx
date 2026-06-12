@@ -1,4 +1,3 @@
-import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalPosition } from "@tauri-apps/api/window";
 import React, { useEffect, useRef, useState } from "react";
@@ -17,10 +16,49 @@ interface MicStatusPayload {
   device: string | null;
 }
 
-interface MeetingPromptPayload {
-  kind: "start" | "stop";
-  app: string;
+const LONG_TRANSCRIBE_TIPS = [
+  "overlay.tipLocal",
+  "overlay.tipMeetings",
+  "overlay.tipWords",
+  "overlay.tipDrag",
+];
+
+interface TranscribeInfo {
+  audioSecs: number;
+  estimatedSecs: number;
 }
+
+/// Determinate-looking ring driven by the time estimate: fills towards 95%
+/// and the overlay disappears when transcription actually completes.
+const ProgressRing: React.FC<{ progress: number }> = ({ progress }) => {
+  const radius = 8.5;
+  const circumference = 2 * Math.PI * radius;
+  return (
+    <svg width="22" height="22" viewBox="0 0 22 22" className="progress-ring">
+      <circle
+        cx="11"
+        cy="11"
+        r={radius}
+        fill="none"
+        stroke="rgba(255,255,255,0.22)"
+        strokeWidth="2.5"
+      />
+      <circle
+        cx="11"
+        cy="11"
+        r={radius}
+        fill="none"
+        stroke="white"
+        strokeWidth="2.5"
+        strokeLinecap="round"
+        strokeDasharray={circumference}
+        strokeDashoffset={circumference * (1 - progress)}
+        transform="rotate(-90 11 11)"
+        style={{ transition: "stroke-dashoffset 250ms linear" }}
+      />
+    </svg>
+  );
+};
 
 const RecordingOverlay: React.FC = () => {
   const { t } = useTranslation();
@@ -30,24 +68,55 @@ const RecordingOverlay: React.FC = () => {
   const [deviceName, setDeviceName] = useState<string | null>(null);
   const [levels, setLevels] = useState<number[]>(Array(16).fill(0));
   const smoothedLevelsRef = useRef<number[]>(Array(16).fill(0));
-  const [meetingPrompt, setMeetingPrompt] =
-    useState<MeetingPromptPayload | null>(null);
+  const [transcribeInfo, setTranscribeInfo] = useState<
+    (TranscribeInfo & { startedAt: number }) | null
+  >(null);
+  const [longMsgIdx, setLongMsgIdx] = useState(0);
+  const [, setClockTick] = useState(0);
   const direction = getLanguageDirection(i18n.language);
 
-  // Unanswered meeting prompts dismiss themselves; the timer is cancelled
-  // when dictation takes over the overlay or a button is clicked.
+  // Drive the ring + countdown while a timed transcription is running.
   useEffect(() => {
-    if (!meetingPrompt) return;
-    const timer = setTimeout(() => {
-      invoke("meeting_prompt_action", { action: "dismiss" });
-      setMeetingPrompt(null);
-    }, 20000);
-    return () => clearTimeout(timer);
-  }, [meetingPrompt]);
+    if (!transcribeInfo) return;
+    const ticker = setInterval(() => setClockTick((n) => n + 1), 250);
+    return () => clearInterval(ticker);
+  }, [transcribeInfo]);
 
-  const answerMeetingPrompt = (action: "record" | "stop" | "dismiss") => {
-    setMeetingPrompt(null);
-    invoke("meeting_prompt_action", { action });
+  // On long audio, alternate the label between the countdown and tips.
+  useEffect(() => {
+    if (!transcribeInfo || transcribeInfo.audioSecs < 60) return;
+    const interval = setInterval(() => setLongMsgIdx((i) => i + 1), 5000);
+    return () => clearInterval(interval);
+  }, [transcribeInfo]);
+
+  const ringProgress = () => {
+    if (!transcribeInfo) return 0;
+    const elapsed = (Date.now() - transcribeInfo.startedAt) / 1000;
+    return Math.min(0.95, elapsed / Math.max(1, transcribeInfo.estimatedSecs));
+  };
+
+  const etaText = () => {
+    if (!transcribeInfo) return t("overlay.transcribing");
+    const elapsed = (Date.now() - transcribeInfo.startedAt) / 1000;
+    const remaining = Math.max(0, transcribeInfo.estimatedSecs - elapsed);
+    if (remaining < 3) return t("overlay.almostDone");
+    // Round up to 5s steps so the number doesn't twitch
+    const display = Math.ceil(remaining / 5) * 5;
+    return display >= 90
+      ? t("overlay.etaMin", { count: Math.round(display / 60) })
+      : t("overlay.etaSecs", { count: display });
+  };
+
+  const transcribingText = () => {
+    if (!transcribeInfo) return t("overlay.transcribing");
+    if (transcribeInfo.audioSecs >= 60 && longMsgIdx % 2 === 1) {
+      return t(
+        LONG_TRANSCRIBE_TIPS[
+          Math.floor(longMsgIdx / 2) % LONG_TRANSCRIBE_TIPS.length
+        ],
+      );
+    }
+    return etaText();
   };
 
   useEffect(() => {
@@ -57,27 +126,26 @@ const RecordingOverlay: React.FC = () => {
         // Sync language from settings each time overlay is shown
         await syncLanguageFromSettings();
         const overlayState = event.payload as OverlayState;
-        setMeetingPrompt(null); // dictation takes precedence over the prompt
         setState(overlayState);
         if (overlayState === "recording") {
           setMicStatus("connecting");
         }
+        setTranscribeInfo(null);
+        setLongMsgIdx(0);
         setIsVisible(true);
       });
 
       // Listen for hide-overlay event from Rust
       const unlistenHide = await listen("hide-overlay", () => {
-        setMeetingPrompt(null);
         setIsVisible(false);
       });
 
-      // Meeting detected (or call ended while recording) — Granola-style ask
-      const unlistenMeetingPrompt = await listen<MeetingPromptPayload>(
-        "meeting-prompt",
-        async (event) => {
-          await syncLanguageFromSettings();
-          setMeetingPrompt(event.payload);
-          setIsVisible(true);
+      // Fired when the audio being transcribed is long enough to show a
+      // progress ring and time estimate
+      const unlistenTranscribingInfo = await listen<TranscribeInfo>(
+        "transcribing-info",
+        (event) => {
+          setTranscribeInfo({ ...event.payload, startedAt: Date.now() });
         },
       );
 
@@ -108,7 +176,7 @@ const RecordingOverlay: React.FC = () => {
       return () => {
         unlistenShow();
         unlistenHide();
-        unlistenMeetingPrompt();
+        unlistenTranscribingInfo();
         unlistenMicStatus();
         unlistenLevel();
       };
@@ -129,8 +197,7 @@ const RecordingOverlay: React.FC = () => {
   } | null>(null);
 
   const startDrag = async (e: React.PointerEvent) => {
-    if ((e.target as HTMLElement).closest(".cancel-button, .prompt-button"))
-      return;
+    if ((e.target as HTMLElement).closest(".cancel-button")) return;
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     const win = getCurrentWindow();
     const [pos, scale] = await Promise.all([
@@ -177,40 +244,16 @@ const RecordingOverlay: React.FC = () => {
       onPointerUp={endDrag}
       onPointerCancel={endDrag}
       className={`recording-overlay ${isVisible ? "fade-in" : ""} ${
-        !meetingPrompt && state === "recording" ? `mic-${micStatus}` : ""
+        state === "recording" ? `mic-${micStatus}` : ""
       }`}
     >
-      {meetingPrompt && (
-        <div className="overlay-main meeting-prompt-row">
-          <div className="prompt-text">
-            {meetingPrompt.kind === "start"
-              ? t("overlay.meetingAsk", { app: meetingPrompt.app })
-              : t("overlay.meetingEnded")}
-          </div>
-          <button
-            className="prompt-button prompt-primary"
-            onClick={() =>
-              answerMeetingPrompt(
-                meetingPrompt.kind === "start" ? "record" : "stop",
-              )
-            }
-          >
-            {meetingPrompt.kind === "start"
-              ? t("overlay.record")
-              : t("overlay.stop")}
-          </button>
-          <div
-            className="cancel-button"
-            onClick={() => answerMeetingPrompt("dismiss")}
-          >
-            <CancelIcon />
-          </div>
-        </div>
-      )}
-
-      {!meetingPrompt && (
       <div className="overlay-main">
-        {state !== "recording" && (
+        {state === "transcribing" && transcribeInfo && (
+          <div className="overlay-left">
+            <ProgressRing progress={ringProgress()} />
+          </div>
+        )}
+        {state !== "recording" && !(state === "transcribing" && transcribeInfo) && (
           <div className="overlay-left">
             <TranscriptionIcon />
           </div>
@@ -234,7 +277,13 @@ const RecordingOverlay: React.FC = () => {
             </div>
           )}
           {state === "transcribing" && (
-            <div className="transcribing-text">{t("overlay.transcribing")}</div>
+            <div
+              className={`transcribing-text ${
+                transcribeInfo && transcribeInfo.audioSecs >= 60 ? "long" : ""
+              }`}
+            >
+              {transcribingText()}
+            </div>
           )}
           {state === "processing" && (
             <div className="transcribing-text">{t("overlay.processing")}</div>
@@ -254,9 +303,8 @@ const RecordingOverlay: React.FC = () => {
           )}
         </div>
       </div>
-      )}
 
-      {!meetingPrompt && state === "recording" && (
+      {state === "recording" && (
         <div className={`mic-status-line ${micStatus}`}>
           {getMicStatusText()}
         </div>

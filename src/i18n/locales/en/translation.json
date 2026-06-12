@@ -615,9 +615,19 @@
     "connecting": "connecting to microphone…",
     "connectingTo": "connecting to {{device}}…",
     "noAudio": "NO AUDIO — microphone is silent",
-    "meetingAsk": "{{app}} call?",
-    "meetingEnded": "Call ended?",
     "record": "Record",
-    "stop": "Stop"
+    "stop": "Stop",
+    "tipLocal": "Did you know? Transcription happens entirely on your Mac.",
+    "tipMeetings": "Did you know? Lark can record and transcribe your meetings too.",
+    "tipWords": "Did you know? Custom Words in Settings makes tricky names stick.",
+    "tipDrag": "Did you know? You can drag this pill anywhere on screen.",
+    "etaSecs": "About {{count}}s left…",
+    "etaMin": "About {{count}} min left…",
+    "almostDone": "Almost done…"
+  },
+  "meetingPrompt": {
+    "detected": "Meeting detected",
+    "ended": "Call ended",
+    "dismiss": "Dismiss"
   }
 }

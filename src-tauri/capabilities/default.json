@@ -4,7 +4,8 @@
   "description": "Capabilities for the app",
   "windows": [
     "main",
-    "recording_overlay"
+    "recording_overlay",
+    "meeting_prompt"
   ],
   "permissions": [
     "core:default",

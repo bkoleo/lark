@@ -624,6 +624,17 @@ impl ShortcutAction for TranscribeAction {
                 } else {
                     // Save WAV concurrently with transcription
                     let sample_count = samples.len();
+
+                    // Long rant? Show a progress ring + time estimate instead
+                    // of a bare "transcribing…".
+                    let audio_secs = (sample_count / 16_000) as u64;
+                    if audio_secs >= 15 {
+                        let speed = crate::managers::transcription::TRANSCRIBE_SPEED_X100
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            .max(100) as u64;
+                        let estimated_secs = (audio_secs * 100 / speed).max(2);
+                        crate::overlay::emit_transcribing_info(&ah, audio_secs, estimated_secs);
+                    }
                     let file_name = format!("handy-{}.wav", chrono::Utc::now().timestamp());
                     let wav_path = hm.recordings_dir().join(&file_name);
                     let wav_path_for_verify = wav_path.clone();

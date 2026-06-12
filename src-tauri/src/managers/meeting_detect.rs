@@ -40,9 +40,62 @@ const MEETING_APPS: &[(&str, &str)] = &[
     ("org.mozilla.firefox", "Firefox"),
 ];
 
+/// Executable-path fragments as a fallback: browser/app HELPER processes
+/// are what actually hold the mic, and they often report no bundle id to
+/// Core Audio at all (this is why anarlog resolves by path too — and why
+/// Brave's test call was missed by bundle-id matching alone).
+const MEETING_APP_PATHS: &[(&str, &str)] = &[
+    ("zoom.us.app", "Zoom"),
+    ("Microsoft Teams.app", "Teams"),
+    ("FaceTime.app", "FaceTime"),
+    ("avconferenced", "FaceTime"),
+    ("Slack.app", "Slack"),
+    ("Discord.app", "Discord"),
+    ("Webex.app", "Webex"),
+    ("Google Chrome", "Chrome"),
+    ("Brave Browser", "Brave"),
+    ("Safari", "Safari"),
+    ("Arc.app", "Arc"),
+    ("Microsoft Edge", "Edge"),
+    ("Firefox", "Firefox"),
+];
+
+/// Executable path for a pid via libproc (part of libSystem, no extra
+/// linking needed).
+fn pid_executable_path(pid: i32) -> Option<String> {
+    extern "C" {
+        fn proc_pidpath(pid: i32, buffer: *mut u8, buffersize: u32) -> i32;
+    }
+    let mut buf = vec![0u8; 4096];
+    let len = unsafe { proc_pidpath(pid, buf.as_mut_ptr(), buf.len() as u32) };
+    if len <= 0 {
+        return None;
+    }
+    buf.truncate(len as usize);
+    String::from_utf8(buf).ok()
+}
+
+fn match_meeting_app(bundle_id: Option<&str>, path: Option<&str>) -> Option<&'static str> {
+    if let Some(bid) = bundle_id {
+        if let Some((_, name)) = MEETING_APPS.iter().find(|(prefix, _)| bid.starts_with(prefix)) {
+            return Some(name);
+        }
+    }
+    if let Some(path) = path {
+        if let Some((_, name)) = MEETING_APP_PATHS
+            .iter()
+            .find(|(fragment, _)| path.contains(fragment))
+        {
+            return Some(name);
+        }
+    }
+    None
+}
+
 pub fn spawn_meeting_detector(app_handle: &AppHandle) {
     let app = app_handle.clone();
     std::thread::spawn(move || {
+        log::info!("Meeting detector started");
         let own_pid = std::process::id() as i32;
         let mut previous: Vec<&'static str> = Vec::new();
         let mut last_prompt: Option<Instant> = None;
@@ -95,22 +148,20 @@ fn mic_using_meeting_apps(own_pid: i32) -> Vec<&'static str> {
         if !process.is_running_input().unwrap_or(false) {
             continue;
         }
-        let Ok(bundle_id) = process.bundle_id() else {
-            continue;
-        };
-        let bundle_id = bundle_id.to_string();
+        let bundle_id = process.bundle_id().ok().map(|s| s.to_string());
+        let path = pid_executable_path(pid);
 
-        match MEETING_APPS
-            .iter()
-            .find(|(prefix, _)| bundle_id.starts_with(prefix))
-        {
-            Some((_, name)) => {
-                if !found.contains(name) {
+        match match_meeting_app(bundle_id.as_deref(), path.as_deref()) {
+            Some(name) => {
+                if !found.contains(&name) {
                     found.push(name);
                 }
             }
-            // Log unknowns so the allowlist can grow from real usage.
-            None => log::debug!("Mic in use by unrecognised app: {bundle_id}"),
+            // Log unknowns (with path!) so the allowlist can grow from
+            // real usage.
+            None => log::debug!(
+                "Mic in use by unmatched process: pid={pid} bundle={bundle_id:?} path={path:?}"
+            ),
         }
     }
     found

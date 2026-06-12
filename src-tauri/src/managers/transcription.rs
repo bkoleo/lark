@@ -9,8 +9,13 @@ use log::{debug, error, info, warn};
 use serde::Serialize;
 use specta::Type;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+
+/// How fast this machine transcribes, as (multiple of realtime) x100,
+/// learned via EMA from completed transcriptions. Starts at a conservative
+/// 6x for an M-series CPU; used to estimate progress for the overlay ring.
+pub static TRANSCRIBE_SPEED_X100: AtomicU32 = AtomicU32::new(600);
 use std::thread;
 use std::time::{Duration, SystemTime};
 use tauri::{AppHandle, Emitter, Manager};
@@ -449,6 +454,7 @@ impl TranscriptionManager {
         self.touch_activity();
 
         let st = std::time::Instant::now();
+        let audio_len = audio.len();
 
         debug!("Audio vector length: {}", audio.len());
 
@@ -718,6 +724,18 @@ impl TranscriptionManager {
             (et - st).as_millis(),
             translation_note
         );
+
+        // Learn this machine's transcription speed (x realtime, EMA) so the
+        // overlay can show a believable progress estimate next time.
+        let audio_secs = audio_len as f64 / 16_000.0;
+        let elapsed_secs = (et - st).as_secs_f64();
+        if audio_secs > 5.0 && elapsed_secs > 0.2 {
+            let measured = (audio_secs / elapsed_secs * 100.0) as u32;
+            let previous = TRANSCRIBE_SPEED_X100.load(std::sync::atomic::Ordering::Relaxed);
+            let blended = ((previous as f64) * 0.7 + (measured as f64) * 0.3) as u32;
+            TRANSCRIBE_SPEED_X100.store(blended.max(50), std::sync::atomic::Ordering::Relaxed);
+            debug!("Transcribe speed: measured {measured}x100 realtime, EMA now {blended}");
+        }
 
         let final_result = filtered_result;
 

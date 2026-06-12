@@ -36,7 +36,7 @@ pub fn meeting_prompt_action(app: AppHandle, action: String) -> Result<(), Strin
                 );
             });
         }
-        crate::overlay::hide_recording_overlay(&app);
+        crate::overlay::hide_meeting_prompt(&app);
         Ok(())
     }
     #[cfg(not(target_os = "macos"))]
