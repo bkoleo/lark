@@ -14,29 +14,48 @@ pub fn cancel_operation(app: AppHandle) {
     cancel_current_operation(&app);
 }
 
-/// Handles a click on the meeting-detected overlay prompt.
-/// "record"/"stop" toggle the meeting recording; "dismiss" just hides.
+/// Handles a click on the meeting card / recording indicator.
+/// "record"/"stop" toggle the meeting recording; "expand_stop" swaps the
+/// mini indicator for the card with a Stop button; "dismiss" collapses
+/// back to the indicator while recording, otherwise hides.
 #[tauri::command]
 #[specta::specta]
 pub fn meeting_prompt_action(app: AppHandle, action: String) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        if matches!(action.as_str(), "record" | "stop") {
-            let meeting_manager = app
-                .state::<std::sync::Arc<crate::managers::meeting::MeetingManager>>()
-                .inner()
-                .clone();
-            let app_clone = app.clone();
-            std::thread::spawn(move || {
-                meeting_manager.toggle();
-                crate::tray::update_tray_menu(
-                    &app_clone,
-                    &crate::tray::TrayIconState::Idle,
-                    None,
-                );
-            });
+        use crate::managers::meeting::{MeetingManager, MeetingStatus};
+        let meeting_manager = app
+            .state::<std::sync::Arc<MeetingManager>>()
+            .inner()
+            .clone();
+
+        match action.as_str() {
+            "record" | "stop" => {
+                let app_clone = app.clone();
+                std::thread::spawn(move || {
+                    meeting_manager.toggle();
+                    crate::tray::update_tray_menu(
+                        &app_clone,
+                        &crate::tray::TrayIconState::Idle,
+                        None,
+                    );
+                });
+                // start(): the indicator appears once the mic is open;
+                // stop: stop_and_process hides the window itself.
+                crate::overlay::hide_meeting_prompt(&app);
+            }
+            "expand_stop" => {
+                crate::overlay::show_meeting_prompt(&app, "stop_ask", "");
+            }
+            _ => {
+                // dismiss
+                if meeting_manager.status() == MeetingStatus::Recording {
+                    crate::overlay::show_meeting_recording_indicator(&app);
+                } else {
+                    crate::overlay::hide_meeting_prompt(&app);
+                }
+            }
         }
-        crate::overlay::hide_meeting_prompt(&app);
         Ok(())
     }
     #[cfg(not(target_os = "macos"))]

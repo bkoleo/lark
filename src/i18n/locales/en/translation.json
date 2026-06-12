@@ -628,6 +628,7 @@
   "meetingPrompt": {
     "detected": "Meeting detected",
     "ended": "Call ended",
-    "dismiss": "Dismiss"
+    "dismiss": "Dismiss",
+    "recording": "Recording meeting"
   }
 }

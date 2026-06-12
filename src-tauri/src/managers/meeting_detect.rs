@@ -20,6 +20,9 @@ use crate::managers::meeting::{MeetingManager, MeetingStatus};
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Don't nag: at most one "record this?" prompt per this window.
 const NOTIFY_COOLDOWN: Duration = Duration::from_secs(300);
+/// After a call ends, auto-stop the recording once this grace passes —
+/// unless the meeting app re-grabs the mic (device switch, reconnect).
+const AUTO_STOP_GRACE: Duration = Duration::from_secs(20);
 
 /// Bundle-id prefixes of apps whose mic use means "probably a meeting".
 /// Prefix matching catches helper processes (e.g. com.google.Chrome.helper).
@@ -99,6 +102,7 @@ pub fn spawn_meeting_detector(app_handle: &AppHandle) {
         let own_pid = std::process::id() as i32;
         let mut previous: Vec<&'static str> = Vec::new();
         let mut last_prompt: Option<Instant> = None;
+        let mut call_end_grace: Option<Instant> = None;
 
         loop {
             std::thread::sleep(POLL_INTERVAL);
@@ -124,8 +128,40 @@ pub fn spawn_meeting_detector(app_handle: &AppHandle) {
             }
 
             if call_ended && status == MeetingStatus::Recording {
-                log::info!("Meeting app released the mic while recording");
+                log::info!(
+                    "Meeting app released the mic while recording — auto-stop in {}s",
+                    AUTO_STOP_GRACE.as_secs()
+                );
                 crate::overlay::show_meeting_prompt(&app, "stop", previous[0]);
+                call_end_grace = Some(Instant::now());
+            }
+
+            // Mic came back during the grace window: the call continues
+            // (device switch / reconnect), cancel the pending auto-stop.
+            if !current.is_empty() && call_end_grace.take().is_some() {
+                if status == MeetingStatus::Recording {
+                    log::info!("Call resumed — auto-stop cancelled");
+                    crate::overlay::show_meeting_recording_indicator(&app);
+                }
+            }
+
+            if let Some(ended_at) = call_end_grace {
+                if status != MeetingStatus::Recording {
+                    // User already stopped (card click, tray, CLI).
+                    call_end_grace = None;
+                } else if ended_at.elapsed() >= AUTO_STOP_GRACE {
+                    call_end_grace = None;
+                    log::info!("Auto-stopping meeting recording (call ended, no action taken)");
+                    if let Some(manager) = app.try_state::<Arc<MeetingManager>>() {
+                        let manager = manager.inner().clone();
+                        manager.toggle();
+                        crate::tray::update_tray_menu(
+                            &app,
+                            &crate::tray::TrayIconState::Idle,
+                            None,
+                        );
+                    }
+                }
             }
 
             previous = current;

@@ -435,18 +435,32 @@ pub fn show_recording_overlay(app_handle: &AppHandle) {
 const MEETING_CARD_WIDTH: f64 = 340.0;
 #[cfg(target_os = "macos")]
 const MEETING_CARD_HEIGHT: f64 = 84.0;
+/// Collapsed while-recording indicator: small and unobtrusive.
+#[cfg(target_os = "macos")]
+const MEETING_MINI_WIDTH: f64 = 130.0;
+#[cfg(target_os = "macos")]
+const MEETING_MINI_HEIGHT: f64 = 48.0;
 
 /// Top-right corner of the monitor the cursor is on (Granola puts its
 /// meeting card there; Kole asked for the same).
 #[cfg(target_os = "macos")]
-fn meeting_card_position(app_handle: &AppHandle) -> Option<(f64, f64)> {
+fn meeting_window_position(app_handle: &AppHandle, width: f64) -> Option<(f64, f64)> {
     let monitor = get_monitor_with_cursor(app_handle)?;
     let scale = monitor.scale_factor();
-    let x = monitor.position().x as f64 / scale + monitor.size().width as f64 / scale
-        - MEETING_CARD_WIDTH
-        - 12.0;
+    let x =
+        monitor.position().x as f64 / scale + monitor.size().width as f64 / scale - width - 12.0;
     let y = monitor.position().y as f64 / scale + 42.0;
     Some((x, y))
+}
+
+#[cfg(target_os = "macos")]
+fn place_meeting_window(app_handle: &AppHandle, width: f64, height: f64) {
+    if let Some(window) = app_handle.get_webview_window("meeting_prompt") {
+        let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize { width, height }));
+        if let Some((x, y)) = meeting_window_position(app_handle, width) {
+            let _ = window.set_position(tauri::Position::Logical(tauri::LogicalPosition { x, y }));
+        }
+    }
 }
 
 /// Creates the meeting-prompt card window (hidden until a meeting is
@@ -455,7 +469,7 @@ fn meeting_card_position(app_handle: &AppHandle) -> Option<(f64, f64)> {
 /// transient top-right ask.
 #[cfg(target_os = "macos")]
 pub fn create_meeting_prompt_window(app_handle: &AppHandle) {
-    let Some((x, y)) = meeting_card_position(app_handle) else {
+    let Some((x, y)) = meeting_window_position(app_handle, MEETING_CARD_WIDTH) else {
         return;
     };
     match PanelBuilder::<_, RecordingOverlayPanel>::new(app_handle, "meeting_prompt")
@@ -491,15 +505,25 @@ pub fn create_meeting_prompt_window(app_handle: &AppHandle) {
 /// (call ended while recording, offer to stop & transcribe).
 #[cfg(target_os = "macos")]
 pub fn show_meeting_prompt(app_handle: &AppHandle, kind: &str, app_name: &str) {
+    place_meeting_window(app_handle, MEETING_CARD_WIDTH, MEETING_CARD_HEIGHT);
     if let Some(window) = app_handle.get_webview_window("meeting_prompt") {
-        if let Some((x, y)) = meeting_card_position(app_handle) {
-            let _ = window.set_position(tauri::Position::Logical(tauri::LogicalPosition { x, y }));
-        }
         let _ = window.show();
         let _ = window.emit(
             "meeting-prompt",
             serde_json::json!({ "kind": kind, "app": app_name }),
         );
+    }
+}
+
+/// While a meeting recording runs, a small pulsing-dot pill stays top-right
+/// so it's always clear Lark is capturing. Clicking it expands back into
+/// the card with a Stop button.
+#[cfg(target_os = "macos")]
+pub fn show_meeting_recording_indicator(app_handle: &AppHandle) {
+    place_meeting_window(app_handle, MEETING_MINI_WIDTH, MEETING_MINI_HEIGHT);
+    if let Some(window) = app_handle.get_webview_window("meeting_prompt") {
+        let _ = window.show();
+        let _ = window.emit("meeting-recording", ());
     }
 }
 

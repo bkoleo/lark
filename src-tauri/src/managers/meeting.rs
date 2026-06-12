@@ -144,6 +144,8 @@ impl MeetingManager {
         drop(state);
 
         self.spawn_mic_watchdog();
+        // Always-visible while recording: the small top-right indicator.
+        crate::overlay::show_meeting_recording_indicator(&self.app_handle);
         Ok(())
     }
 
@@ -224,6 +226,10 @@ impl MeetingManager {
                 }
             }
         };
+
+        // Recording is over — drop the indicator regardless of how the stop
+        // was triggered (card, tray, or CLI).
+        crate::overlay::hide_meeting_prompt(&self.app_handle);
 
         let mut mic_samples = mic_prefix;
         match mic.stop() {
