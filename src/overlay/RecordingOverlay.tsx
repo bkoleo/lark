@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalPosition } from "@tauri-apps/api/window";
 import React, { useEffect, useRef, useState } from "react";
@@ -16,6 +17,11 @@ interface MicStatusPayload {
   device: string | null;
 }
 
+interface MeetingPromptPayload {
+  kind: "start" | "stop";
+  app: string;
+}
+
 const RecordingOverlay: React.FC = () => {
   const { t } = useTranslation();
   const [isVisible, setIsVisible] = useState(false);
@@ -24,7 +30,25 @@ const RecordingOverlay: React.FC = () => {
   const [deviceName, setDeviceName] = useState<string | null>(null);
   const [levels, setLevels] = useState<number[]>(Array(16).fill(0));
   const smoothedLevelsRef = useRef<number[]>(Array(16).fill(0));
+  const [meetingPrompt, setMeetingPrompt] =
+    useState<MeetingPromptPayload | null>(null);
   const direction = getLanguageDirection(i18n.language);
+
+  // Unanswered meeting prompts dismiss themselves; the timer is cancelled
+  // when dictation takes over the overlay or a button is clicked.
+  useEffect(() => {
+    if (!meetingPrompt) return;
+    const timer = setTimeout(() => {
+      invoke("meeting_prompt_action", { action: "dismiss" });
+      setMeetingPrompt(null);
+    }, 20000);
+    return () => clearTimeout(timer);
+  }, [meetingPrompt]);
+
+  const answerMeetingPrompt = (action: "record" | "stop" | "dismiss") => {
+    setMeetingPrompt(null);
+    invoke("meeting_prompt_action", { action });
+  };
 
   useEffect(() => {
     const setupEventListeners = async () => {
@@ -33,6 +57,7 @@ const RecordingOverlay: React.FC = () => {
         // Sync language from settings each time overlay is shown
         await syncLanguageFromSettings();
         const overlayState = event.payload as OverlayState;
+        setMeetingPrompt(null); // dictation takes precedence over the prompt
         setState(overlayState);
         if (overlayState === "recording") {
           setMicStatus("connecting");
@@ -42,8 +67,19 @@ const RecordingOverlay: React.FC = () => {
 
       // Listen for hide-overlay event from Rust
       const unlistenHide = await listen("hide-overlay", () => {
+        setMeetingPrompt(null);
         setIsVisible(false);
       });
+
+      // Meeting detected (or call ended while recording) — Granola-style ask
+      const unlistenMeetingPrompt = await listen<MeetingPromptPayload>(
+        "meeting-prompt",
+        async (event) => {
+          await syncLanguageFromSettings();
+          setMeetingPrompt(event.payload);
+          setIsVisible(true);
+        },
+      );
 
       // Mic flow status from the recording watchdog
       const unlistenMicStatus = await listen<MicStatusPayload>(
@@ -72,6 +108,7 @@ const RecordingOverlay: React.FC = () => {
       return () => {
         unlistenShow();
         unlistenHide();
+        unlistenMeetingPrompt();
         unlistenMicStatus();
         unlistenLevel();
       };
@@ -92,7 +129,8 @@ const RecordingOverlay: React.FC = () => {
   } | null>(null);
 
   const startDrag = async (e: React.PointerEvent) => {
-    if ((e.target as HTMLElement).closest(".cancel-button")) return;
+    if ((e.target as HTMLElement).closest(".cancel-button, .prompt-button"))
+      return;
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     const win = getCurrentWindow();
     const [pos, scale] = await Promise.all([
@@ -139,9 +177,38 @@ const RecordingOverlay: React.FC = () => {
       onPointerUp={endDrag}
       onPointerCancel={endDrag}
       className={`recording-overlay ${isVisible ? "fade-in" : ""} ${
-        state === "recording" ? `mic-${micStatus}` : ""
+        !meetingPrompt && state === "recording" ? `mic-${micStatus}` : ""
       }`}
     >
+      {meetingPrompt && (
+        <div className="overlay-main meeting-prompt-row">
+          <div className="prompt-text">
+            {meetingPrompt.kind === "start"
+              ? t("overlay.meetingAsk", { app: meetingPrompt.app })
+              : t("overlay.meetingEnded")}
+          </div>
+          <button
+            className="prompt-button prompt-primary"
+            onClick={() =>
+              answerMeetingPrompt(
+                meetingPrompt.kind === "start" ? "record" : "stop",
+              )
+            }
+          >
+            {meetingPrompt.kind === "start"
+              ? t("overlay.record")
+              : t("overlay.stop")}
+          </button>
+          <div
+            className="cancel-button"
+            onClick={() => answerMeetingPrompt("dismiss")}
+          >
+            <CancelIcon />
+          </div>
+        </div>
+      )}
+
+      {!meetingPrompt && (
       <div className="overlay-main">
         {state !== "recording" && (
           <div className="overlay-left">
@@ -187,8 +254,9 @@ const RecordingOverlay: React.FC = () => {
           )}
         </div>
       </div>
+      )}
 
-      {state === "recording" && (
+      {!meetingPrompt && state === "recording" && (
         <div className={`mic-status-line ${micStatus}`}>
           {getMicStatusText()}
         </div>

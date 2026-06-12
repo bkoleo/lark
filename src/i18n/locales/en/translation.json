@@ -614,6 +614,10 @@
     "processing": "Processing...",
     "connecting": "connecting to microphone…",
     "connectingTo": "connecting to {{device}}…",
-    "noAudio": "NO AUDIO — microphone is silent"
+    "noAudio": "NO AUDIO — microphone is silent",
+    "meetingAsk": "{{app}} call?",
+    "meetingEnded": "Call ended?",
+    "record": "Record",
+    "stop": "Stop"
   }
 }

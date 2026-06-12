@@ -14,6 +14,38 @@ pub fn cancel_operation(app: AppHandle) {
     cancel_current_operation(&app);
 }
 
+/// Handles a click on the meeting-detected overlay prompt.
+/// "record"/"stop" toggle the meeting recording; "dismiss" just hides.
+#[tauri::command]
+#[specta::specta]
+pub fn meeting_prompt_action(app: AppHandle, action: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        if matches!(action.as_str(), "record" | "stop") {
+            let meeting_manager = app
+                .state::<std::sync::Arc<crate::managers::meeting::MeetingManager>>()
+                .inner()
+                .clone();
+            let app_clone = app.clone();
+            std::thread::spawn(move || {
+                meeting_manager.toggle();
+                crate::tray::update_tray_menu(
+                    &app_clone,
+                    &crate::tray::TrayIconState::Idle,
+                    None,
+                );
+            });
+        }
+        crate::overlay::hide_recording_overlay(&app);
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, action);
+        Err("meeting mode is macOS-only".to_string())
+    }
+}
+
 #[tauri::command]
 #[specta::specta]
 pub fn is_portable() -> bool {

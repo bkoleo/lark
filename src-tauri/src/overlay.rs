@@ -427,6 +427,27 @@ pub fn show_recording_overlay(app_handle: &AppHandle) {
     show_overlay_state(app_handle, "recording");
 }
 
+/// Shows the meeting-detected prompt in the overlay pill (Granola-style):
+/// "<app> call? [Record] [x]". kind is "start" (call began, offer to record)
+/// or "stop" (call ended while recording, offer to stop & transcribe).
+#[cfg(target_os = "macos")]
+pub fn show_meeting_prompt(app_handle: &AppHandle, kind: &str, app_name: &str) {
+    let settings = settings::get_settings(app_handle);
+    if settings.overlay_position == OverlayPosition::None {
+        return;
+    }
+
+    update_overlay_position(app_handle);
+
+    if let Some(overlay_window) = app_handle.get_webview_window("recording_overlay") {
+        let _ = overlay_window.show();
+        let _ = overlay_window.emit(
+            "meeting-prompt",
+            serde_json::json!({ "kind": kind, "app": app_name }),
+        );
+    }
+}
+
 /// Shows the transcribing overlay window
 pub fn show_transcribing_overlay(app_handle: &AppHandle) {
     show_overlay_state(app_handle, "transcribing");

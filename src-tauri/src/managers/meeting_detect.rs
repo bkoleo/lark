@@ -1,18 +1,19 @@
 //! Meeting detection (macOS): watches which processes hold the microphone
 //! via Core Audio process objects — the same signal that lights the orange
-//! menu-bar dot. When a known meeting app grabs the mic, Lark sends a
-//! notification suggesting a recording; when the app releases it during a
-//! recording, it suggests stopping.
+//! menu-bar dot. When a known meeting app grabs the mic, Lark shows a
+//! Granola-style prompt in its own overlay pill ("Zoom call? Record");
+//! when the app releases the mic during a recording, it offers to stop.
 //!
-//! Deliberately notification-only in the spike: Lark never starts or stops
-//! a meeting recording on its own.
+//! The prompt lives in Lark's overlay rather than macOS notifications:
+//! self-signed apps don't reliably register with Notification Center, and
+//! the overlay needs no permission at all. Deliberately prompt-only:
+//! Lark never starts or stops a meeting recording on its own.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cidre::core_audio as ca;
 use tauri::{AppHandle, Manager};
-use tauri_plugin_notification::{NotificationExt, PermissionState};
 
 use crate::managers::meeting::{MeetingManager, MeetingStatus};
 
@@ -42,13 +43,6 @@ const MEETING_APPS: &[(&str, &str)] = &[
 pub fn spawn_meeting_detector(app_handle: &AppHandle) {
     let app = app_handle.clone();
     std::thread::spawn(move || {
-        // Ask for notification permission once, up front.
-        if let Ok(state) = app.notification().permission_state() {
-            if state != PermissionState::Granted {
-                let _ = app.notification().request_permission();
-            }
-        }
-
         let own_pid = std::process::id() as i32;
         let mut previous: Vec<&'static str> = Vec::new();
         let mut last_prompt: Option<Instant> = None;
@@ -71,34 +65,19 @@ pub fn spawn_meeting_detector(app_handle: &AppHandle) {
                     .unwrap_or(true);
                 if cooled_down {
                     log::info!("Meeting detected: {} is using the mic", current[0]);
-                    notify(
-                        &app,
-                        &format!(
-                            "{} is using the mic. Record the meeting? Click the Lark menu bar icon.",
-                            current[0]
-                        ),
-                    );
+                    crate::overlay::show_meeting_prompt(&app, "start", current[0]);
                     last_prompt = Some(Instant::now());
                 }
             }
 
             if call_ended && status == MeetingStatus::Recording {
                 log::info!("Meeting app released the mic while recording");
-                notify(
-                    &app,
-                    "The call seems to have ended. Stop & transcribe from the Lark menu bar icon.",
-                );
+                crate::overlay::show_meeting_prompt(&app, "stop", previous[0]);
             }
 
             previous = current;
         }
     });
-}
-
-fn notify(app: &AppHandle, body: &str) {
-    if let Err(e) = app.notification().builder().title("Lark").body(body).show() {
-        log::warn!("Failed to show meeting notification: {e}");
-    }
 }
 
 /// Friendly names of known meeting apps currently holding the microphone.
