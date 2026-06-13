@@ -70,6 +70,12 @@ pub struct MeetingManager {
 
 impl MeetingManager {
     pub fn new(app_handle: &AppHandle) -> Self {
+        // Sweep expired meeting WAVs at startup too — meetings don't happen
+        // every day, but the disk pressure does.
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(30));
+            cleanup_old_meeting_wavs();
+        });
         Self {
             app_handle: app_handle.clone(),
             state: Mutex::new(MeetingState::Idle),
@@ -293,10 +299,11 @@ impl MeetingManager {
         sys_samples: Vec<f32>,
         started: DateTime<Local>,
     ) -> Result<PathBuf> {
-        let home = std::env::var("HOME").map_err(|_| anyhow!("HOME not set"))?;
-        let out_dir = PathBuf::from(home).join("Documents").join("Lark Meetings");
+        let out_dir = meetings_dir()?;
         std::fs::create_dir_all(&out_dir)?;
         let stem = format!("{} Meeting", started.format("%Y-%m-%d %H%M"));
+
+        cleanup_old_meeting_wavs();
 
         // Keep the raw tracks next to the transcript while meeting mode is a
         // spike — lets us debug a bad transcript by listening back.
@@ -405,6 +412,43 @@ impl MeetingManager {
 /// Truncate or zero-pad to the expected wall-clock sample count.
 fn fit_to_length(samples: &mut Vec<f32>, expected: usize) {
     samples.resize(expected, 0.0);
+}
+
+fn meetings_dir() -> Result<PathBuf> {
+    let home = std::env::var("HOME").map_err(|_| anyhow!("HOME not set"))?;
+    Ok(PathBuf::from(home).join("Documents").join("Lark Meetings"))
+}
+
+/// Raw meeting audio follows Kole's AudioDay1 dictation policy: keep WAVs
+/// for 24h (debugging window), keep transcripts forever. ~275MB per hour
+/// of meeting on a chronically full disk says delete.
+fn cleanup_old_meeting_wavs() {
+    let Ok(dir) = meetings_dir() else { return };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let cutoff = std::time::SystemTime::now() - Duration::from_secs(24 * 3600);
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_wav = path
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("wav"))
+            .unwrap_or(false);
+        if !is_wav {
+            continue;
+        }
+        let expired = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|t| t < cutoff)
+            .unwrap_or(false);
+        if expired {
+            match std::fs::remove_file(&path) {
+                Ok(()) => log::info!("Deleted expired meeting audio: {}", path.display()),
+                Err(e) => log::warn!("Failed to delete {}: {e}", path.display()),
+            }
+        }
+    }
 }
 
 /// Without headphones the mic also hears the call audio from the speakers,
