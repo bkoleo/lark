@@ -403,6 +403,9 @@ pub fn run(cli_args: CliArgs) {
             show_main_window_command,
             commands::cancel_operation,
             commands::meeting_prompt_action,
+            commands::meetings::list_meeting_notes,
+            commands::meetings::open_meeting_note,
+            commands::meetings::open_meetings_folder,
             commands::is_portable,
             commands::get_app_dir_path,
             commands::get_app_settings,
@@ -552,8 +555,8 @@ pub fn run(cli_args: CliArgs) {
             let mut win_builder =
                 tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("/".into()))
                     .title("Lark")
-                    .inner_size(680.0, 570.0)
-                    .min_inner_size(680.0, 570.0)
+                    .inner_size(816.0, 684.0)
+                    .min_inner_size(816.0, 684.0)
                     .resizable(true)
                     .maximizable(false)
                     .visible(false);

@@ -18,7 +18,8 @@
     "postProcessing": "Post Process",
     "history": "History",
     "debug": "Debug",
-    "about": "About"
+    "about": "About",
+    "meetings": "Meetings"
   },
   "onboarding": {
     "subtitle": "To get started, choose a transcription model",
@@ -630,5 +631,11 @@
     "ended": "Call ended",
     "dismiss": "Dismiss",
     "recording": "Recording meeting"
+  },
+  "meetings": {
+    "searchPlaceholder": "Search meetings…",
+    "openFolder": "Open meetings folder",
+    "empty": "No meeting notes yet. When a call starts, Lark will offer to record it — transcripts land here.",
+    "noResults": "No meetings match your search."
   }
 }

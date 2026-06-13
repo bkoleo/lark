@@ -4,8 +4,8 @@
   /* Design tokens */
   --color-text: #0f0f0f;
   --color-background: #fbfbfb;
-  --color-background-ui: #da5893;
-  --color-logo-primary: #faa2ca;
+  --color-background-ui: #c98a2e;
+  --color-logo-primary: #d08a28;
   --color-logo-stroke: #382731;
   --color-text-stroke: #f6f6f6;
   --color-mid-gray: #808080;
@@ -20,7 +20,7 @@
   /* Colors - Light Theme */
   /* --color-text: #0f0f0f;
   --color-background: #fbfbfb;
-  --color-logo-primary: #FAA2CA;
+  --color-logo-primary: #d08a28;
   --color-logo-stroke: #382731;
   --color-text-stroke: #f6f6f6; */
 
@@ -57,8 +57,8 @@
     /* Colors - Dark Theme */
     --color-text: #fbfbfb;
     --color-background: #2c2b29;
-    --color-logo-primary: #f28cbb;
-    --color-logo-stroke: #fad1ed;
+    --color-logo-primary: #e8a33d;
+    --color-logo-stroke: #f0dcb4;
   }
 }
 

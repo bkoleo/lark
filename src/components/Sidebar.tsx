@@ -1,11 +1,11 @@
 import React from "react";
 import { useTranslation } from "react-i18next";
-import { Cog, FlaskConical, History, Info, Sparkles } from "lucide-react";
-import HandyTextLogo from "./icons/HandyTextLogo";
-import HandyHand from "./icons/HandyHand";
+import { Cog, FlaskConical, History, Info, Mic, NotebookText, Sparkles } from "lucide-react";
+import LarkWordmark from "./icons/LarkWordmark";
 import { useSettings } from "../hooks/useSettings";
 import {
   GeneralSettings,
+  MeetingsSettings,
   AdvancedSettings,
   HistorySettings,
   DebugSettings,
@@ -33,8 +33,14 @@ interface SectionConfig {
 export const SECTIONS_CONFIG = {
   general: {
     labelKey: "sidebar.general",
-    icon: HandyHand,
+    icon: Mic,
     component: GeneralSettings,
+    enabled: () => true,
+  },
+  meetings: {
+    labelKey: "sidebar.meetings",
+    icon: NotebookText,
+    component: MeetingsSettings,
     enabled: () => true,
   },
   advanced: {
@@ -87,7 +93,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
   return (
     <div className="flex flex-col w-40 h-full border-e border-mid-gray/20 items-center px-2">
-      <HandyTextLogo width={120} className="m-4" />
+      <LarkWordmark className="m-4 text-lg opacity-75" />
       <div className="flex flex-col w-full items-center gap-1 pt-2 border-t border-mid-gray/20">
         {availableSections.map((section) => {
           const Icon = section.icon;
