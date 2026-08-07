@@ -19,6 +19,13 @@
 //! - **Permission is requested, not assumed.** First run shows the macOS
 //!   "Lark would like to access your calendar" prompt; a denial is cached by
 //!   the OS and simply yields `None` from then on.
+//!
+//! Two things have to be in the bundle for that prompt to appear at all, and
+//! only one of them is obvious: the `NSCalendars*UsageDescription` strings in
+//! Info.plist, **and** `com.apple.security.personal-information.calendars` in
+//! Entitlements.plist. The app runs under the Hardened Runtime, which refuses
+//! the personal-information resources in-process when the entitlement is
+//! absent — instantly, with no dialog and nothing in tccd's log to explain it.
 
 #[cfg(target_os = "macos")]
 mod imp {
@@ -132,22 +139,55 @@ mod imp {
     /// first time and give up rather than hold a recording hostage to a dialog.
     /// macOS remembers the decision, so this only ever costs the first run.
     unsafe fn ensure_access(store: &EKEventStore) -> bool {
-        // `Authorized` is the pre-macOS-14 spelling of `FullAccess` and shares
-        // its discriminant — matching both is an unreachable arm, not safety.
-        match EKEventStore::authorizationStatusForEntityType(EKEntityType::Event) {
+        // Values, so nobody has to re-derive them from the deprecation notice:
+        // NotDetermined 0, Restricted 1, Denied 2, FullAccess 3, WriteOnly 4.
+        // `Authorized` is the pre-macOS-14 spelling of `FullAccess` and really
+        // does share its discriminant (3) — matching both would be an
+        // unreachable arm, not safety. `WriteOnly` (4) is not enough for us:
+        // it permits saving new events, never reading the one we want to name
+        // the recording after, so it falls through to the request below.
+        let status = EKEventStore::authorizationStatusForEntityType(EKEntityType::Event);
+        match status {
             EKAuthorizationStatus::FullAccess => return true,
             EKAuthorizationStatus::Denied | EKAuthorizationStatus::Restricted => {
-                log::info!("Calendar access denied — meetings will be recorded without a title");
+                log::warn!(
+                    "Calendar access refused by macOS (status {}) — recording without a title. \
+                     Grant it in System Settings > Privacy & Security > Calendars.",
+                    status.0
+                );
                 return false;
             }
             _ => {}
         }
 
+        log::info!(
+            "Requesting calendar access (current status {})",
+            status.0
+        );
+
         use std::sync::{Arc, Mutex};
-        let granted = Arc::new(Mutex::new(None::<bool>));
-        let sink = granted.clone();
-        let handler = block2::RcBlock::new(move |ok: objc2::runtime::Bool, _err: *mut objc2_foundation::NSError| {
-            *sink.lock().unwrap() = Some(ok.as_bool());
+        // The completion block hands back *why*, not just *whether*. A silent
+        // "not granted" cost six days of assuming the user had ignored a dialog
+        // that macOS never showed: the app was missing the
+        // `com.apple.security.personal-information.calendars` entitlement, and
+        // under the Hardened Runtime that is refused in-process before TCC is
+        // consulted — no prompt, no tccd log line, no TCC.db row. The NSError
+        // is the only place that distinguishes it from a real user denial.
+        let outcome = Arc::new(Mutex::new(None::<(bool, Option<String>)>));
+        let sink = outcome.clone();
+        let handler = block2::RcBlock::new(move |ok: objc2::runtime::Bool, err: *mut objc2_foundation::NSError| {
+            let detail = if err.is_null() {
+                None
+            } else {
+                let err = &*err;
+                Some(format!(
+                    "{} {}: {}",
+                    err.domain(),
+                    err.code(),
+                    err.localizedDescription()
+                ))
+            };
+            *sink.lock().unwrap() = Some((ok.as_bool(), detail));
         });
         store.requestFullAccessToEventsWithCompletion(block2::RcBlock::as_ptr(&handler));
         // Deliberately leaked. If the user leaves the permission dialog sitting
@@ -160,9 +200,13 @@ mod imp {
         // UI thread, so there is nothing to pump here.
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while std::time::Instant::now() < deadline {
-            if let Some(ok) = *granted.lock().unwrap() {
+            let answer = outcome.lock().unwrap().clone();
+            if let Some((ok, detail)) = answer {
                 if !ok {
-                    log::info!("Calendar access not granted — recording without a title");
+                    log::warn!(
+                        "Calendar access not granted — recording without a title. EventKit said: {}",
+                        detail.as_deref().unwrap_or("no error returned")
+                    );
                 }
                 return ok;
             }

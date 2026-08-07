@@ -6,5 +6,13 @@
     <true/>
     <key>com.apple.security.device.audio-input</key>
     <true/>
+    <!-- Required to read the calendar event a meeting recording overlaps.
+         The app runs under the Hardened Runtime, which gates the "personal
+         information" resources on an entitlement *before* TCC is ever
+         consulted. Without this key EventKit refuses instantly: no permission
+         dialog, no tccd activity, no TCC.db row — just granted=false. The
+         Info.plist usage strings alone are not enough. -->
+    <key>com.apple.security.personal-information.calendars</key>
+    <true/>
   </dict>
 </plist>
