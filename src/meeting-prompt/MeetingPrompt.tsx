@@ -7,7 +7,7 @@ import { syncLanguageFromSettings } from "@/i18n";
 import "./MeetingPrompt.css";
 
 interface MeetingPromptPayload {
-  kind: "start" | "stop" | "stop_ask";
+  kind: "start" | "stop" | "stop_ask" | "saved";
   app: string;
 }
 
@@ -50,7 +50,10 @@ const MeetingPrompt: React.FC = () => {
   // indicator if a recording is running — the backend decides).
   useEffect(() => {
     if (mode?.view !== "prompt") return;
-    const timer = setTimeout(() => answer("dismiss"), 20000);
+    // The "saved" confirmation is a brief beat; the actionable prompts wait
+    // longer for the user to respond.
+    const ms = mode.payload.kind === "saved" ? 6000 : 20000;
+    const timer = setTimeout(() => answer("dismiss"), ms);
     return () => clearTimeout(timer);
   }, [mode]);
 
@@ -89,6 +92,31 @@ const MeetingPrompt: React.FC = () => {
   }
 
   const { payload } = mode;
+
+  // "Recorded successfully" closure beat shown after a meeting transcript is
+  // written — reassurance without stealing focus, then auto-dismisses.
+  if (payload.kind === "saved") {
+    return (
+      <div className="meeting-card fade-in">
+        <div className="meeting-card-text">
+          <div className="meeting-card-title">
+            {t("meetingPrompt.savedTitle")}
+          </div>
+          <div className="meeting-card-app">
+            {t("meetingPrompt.savedSubtitle")}
+          </div>
+        </div>
+        <button
+          className="meeting-card-dismiss"
+          onClick={() => answer("dismiss")}
+          aria-label={t("meetingPrompt.dismiss")}
+        >
+          <CancelIcon />
+        </button>
+      </div>
+    );
+  }
+
   const title =
     payload.kind === "start"
       ? t("meetingPrompt.detected")

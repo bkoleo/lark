@@ -5,8 +5,8 @@ import LarkWordmark from "./icons/LarkWordmark";
 import { useSettings } from "../hooks/useSettings";
 import {
   GeneralSettings,
+  MicrophoneSettings,
   MeetingsSettings,
-  AdvancedSettings,
   HistorySettings,
   DebugSettings,
   AboutSettings,
@@ -33,20 +33,20 @@ interface SectionConfig {
 export const SECTIONS_CONFIG = {
   general: {
     labelKey: "sidebar.general",
-    icon: Mic,
+    icon: Cog,
     component: GeneralSettings,
+    enabled: () => true,
+  },
+  microphone: {
+    labelKey: "sidebar.microphone",
+    icon: Mic,
+    component: MicrophoneSettings,
     enabled: () => true,
   },
   meetings: {
     labelKey: "sidebar.meetings",
     icon: NotebookText,
     component: MeetingsSettings,
-    enabled: () => true,
-  },
-  advanced: {
-    labelKey: "sidebar.advanced",
-    icon: Cog,
-    component: AdvancedSettings,
     enabled: () => true,
   },
   history: {

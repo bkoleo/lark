@@ -210,6 +210,23 @@ impl HistoryManager {
         })
     }
 
+    /// Returns every history entry, newest first. Used by startup recovery to
+    /// find recordings whose transcription never completed (empty text) or that
+    /// have no history row at all.
+    pub fn get_all_entries(&self) -> Result<Vec<HistoryEntry>> {
+        let conn = self.get_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested
+             FROM transcription_history ORDER BY timestamp DESC",
+        )?;
+        let rows = stmt.query_map([], Self::map_history_entry)?;
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row?);
+        }
+        Ok(entries)
+    }
+
     pub fn recordings_dir(&self) -> &std::path::Path {
         &self.recordings_dir
     }

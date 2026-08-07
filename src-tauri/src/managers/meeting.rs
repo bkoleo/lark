@@ -26,6 +26,7 @@ use tauri_plugin_opener::OpenerExt;
 use crate::audio_toolkit::audio::SystemAudioTap;
 use crate::audio_toolkit::audio::{list_input_devices, save_wav_file, AudioRecorder};
 use crate::helpers::clamshell;
+use crate::managers::meeting_calendar::{self, CalendarContext};
 use crate::managers::transcription::TranscriptionManager;
 use crate::settings::get_settings;
 
@@ -59,6 +60,10 @@ enum MeetingState {
         restarts: u32,
         tap: SystemAudioTap,
         started: DateTime<Local>,
+        /// Filled in on a background thread — the first-ever lookup can sit on
+        /// a permission dialog for as long as the user takes to answer it, and
+        /// nothing about starting a recording may wait for that.
+        calendar: Arc<Mutex<Option<CalendarContext>>>,
     },
     Processing,
 }
@@ -71,10 +76,15 @@ pub struct MeetingManager {
 impl MeetingManager {
     pub fn new(app_handle: &AppHandle) -> Self {
         // Sweep expired meeting WAVs at startup too — meetings don't happen
-        // every day, but the disk pressure does.
-        std::thread::spawn(|| {
+        // every day, but the disk pressure does. Same pass recovers any
+        // transcript orphaned by a run that died mid-batch.
+        let handle = app_handle.clone();
+        std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(30));
-            cleanup_old_meeting_wavs();
+            if let Ok(dir) = meetings_dir_for(&handle) {
+                cleanup_old_meeting_wavs(&dir);
+            }
+            recover_orphaned_meetings(&handle);
         });
         Self {
             app_handle: app_handle.clone(),
@@ -137,6 +147,17 @@ impl MeetingManager {
             "Meeting recording started (mic: {})",
             mic.device_name().unwrap_or_else(|| "default".into())
         );
+        // Resolve the calendar event off-thread; process() reads it ~an hour
+        // later, so there is no race worth guarding beyond the mutex.
+        let calendar = Arc::new(Mutex::new(None));
+        let calendar_sink = calendar.clone();
+        std::thread::spawn(move || {
+            if let Some(ctx) = meeting_calendar::current_event() {
+                log::info!("Meeting matched calendar event: {:?}", ctx.title);
+                *calendar_sink.lock().unwrap() = Some(ctx);
+            }
+        });
+
         *state = MeetingState::Recording {
             mic,
             mic_prefix: Vec::new(),
@@ -146,6 +167,7 @@ impl MeetingManager {
             restarts: 0,
             tap,
             started: Local::now(),
+            calendar,
         };
         drop(state);
 
@@ -214,7 +236,7 @@ impl MeetingManager {
     }
 
     fn stop_and_process(self: &Arc<Self>) {
-        let (mut mic, mic_prefix, mic_started, restarts, tap, started) = {
+        let (mut mic, mic_prefix, mic_started, restarts, tap, started, calendar) = {
             let mut state = self.state.lock().unwrap();
             match std::mem::replace(&mut *state, MeetingState::Processing) {
                 MeetingState::Recording {
@@ -224,8 +246,17 @@ impl MeetingManager {
                     restarts,
                     tap,
                     started,
+                    calendar,
                     ..
-                } => (mic, mic_prefix, mic_started, restarts, tap, started),
+                } => (
+                    mic,
+                    mic_prefix,
+                    mic_started,
+                    restarts,
+                    tap,
+                    started,
+                    calendar,
+                ),
                 other => {
                     *state = other;
                     return;
@@ -273,7 +304,8 @@ impl MeetingManager {
 
         let manager = self.clone();
         std::thread::spawn(move || {
-            let result = manager.process(mic_samples, sys_samples, started);
+            let calendar = calendar.lock().unwrap().clone();
+            let result = manager.process(mic_samples, sys_samples, started, calendar);
             *manager.state.lock().unwrap() = MeetingState::Idle;
             crate::tray::update_tray_menu(
                 &manager.app_handle,
@@ -287,6 +319,10 @@ impl MeetingManager {
                         .app_handle
                         .opener()
                         .open_path(path.to_string_lossy().to_string(), None::<String>);
+                    // Visible "it's done" beat. The card is an always-on-top
+                    // panel, so this confirmation shows even while the main
+                    // window is hidden during/after a call.
+                    crate::overlay::show_meeting_prompt(&manager.app_handle, "saved", "");
                 }
                 Err(e) => log::error!("Meeting transcription failed: {e}"),
             }
@@ -298,12 +334,23 @@ impl MeetingManager {
         mic_samples: Vec<f32>,
         sys_samples: Vec<f32>,
         started: DateTime<Local>,
+        calendar: Option<CalendarContext>,
     ) -> Result<PathBuf> {
-        let out_dir = meetings_dir()?;
+        let out_dir = meetings_dir_for(&self.app_handle)?;
         std::fs::create_dir_all(&out_dir)?;
-        let stem = format!("{} Meeting", started.format("%Y-%m-%d %H%M"));
 
-        cleanup_old_meeting_wavs();
+        // "2026-08-01 0930 Wilow standup" beats "2026-08-01 0930 Meeting" for a
+        // human scanning the folder, and gives the downstream agents something
+        // to put in a recap headline. Date-first so the folder sorts by time.
+        let label = calendar
+            .as_ref()
+            .and_then(|c| c.title.as_deref())
+            .map(sanitise_for_filename)
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "Meeting".to_string());
+        let stem = format!("{} {}", started.format("%Y-%m-%d %H%M"), label);
+
+        cleanup_old_meeting_wavs(&out_dir);
 
         // Keep the raw tracks next to the transcript while meeting mode is a
         // spike — lets us debug a bad transcript by listening back.
@@ -334,6 +381,15 @@ impl MeetingManager {
             .map(|(s, e)| (e - s) / SAMPLE_RATE)
             .sum();
 
+        // Crash-safety: append every segment to a sidecar the moment it comes
+        // back, before anything else can fail. Batch transcription of a long
+        // meeting has been OOM-killed on this 8GB machine mid-run (a 31-min
+        // customer demo, 2026-06-19), and because the `.md` was only written
+        // at the very end, 88 good segments died with the process. The sidecar
+        // carries the track label too, which the log-scrape recovery could not.
+        let partial_path = out_dir.join(format!("{stem}.partial.jsonl"));
+        let mut partial = std::fs::File::create(&partial_path).ok();
+
         let mut entries: Vec<(usize, &'static str, String)> = Vec::new();
         for (samples, segments, speaker) in [
             (&mic_samples, &mic_segments, "Kole"),
@@ -344,6 +400,7 @@ impl MeetingManager {
                     Ok(text) => {
                         let text = text.trim().to_string();
                         if !text.is_empty() {
+                            append_partial(partial.as_mut(), start, speaker, &text);
                             entries.push((start, speaker, text));
                         }
                     }
@@ -353,17 +410,53 @@ impl MeetingManager {
                 }
             }
         }
+        drop(partial);
         entries.sort_by_key(|(start, _, _)| *start);
         let entries = drop_mic_bleed(entries);
 
         let duration_secs = mic_samples.len().max(sys_samples.len()) / SAMPLE_RATE;
         let mut md = String::new();
+
+        // YAML frontmatter, because the consumers are machines as much as they
+        // are Kole: the Meeting Digest needs a title and an attendee list to
+        // decide whether a recording qualifies for a recap, and to head it.
+        // Emitted unconditionally so a parser never has to handle its absence.
+        md.push_str("---\n");
+        md.push_str(&format!("date: {}\n", started.format("%Y-%m-%d")));
+        md.push_str(&format!("start: {}\n", started.format("%H:%M")));
+        md.push_str(&format!("duration_minutes: {}\n", duration_secs / 60));
+        match calendar.as_ref().and_then(|c| c.title.as_deref()) {
+            Some(title) => md.push_str(&format!("title: {}\n", yaml_scalar(title))),
+            None => md.push_str("title: null\n"),
+        }
+        let attendees = calendar.as_ref().map(|c| c.attendees.clone()).unwrap_or_default();
+        if attendees.is_empty() {
+            md.push_str("attendees: []\n");
+        } else {
+            md.push_str("attendees:\n");
+            for a in &attendees {
+                md.push_str(&format!("  - {}\n", yaml_scalar(a)));
+            }
+        }
+        // Lets a consumer tell "the calendar said nobody was there" apart from
+        // "we never asked the calendar", which change the meaning of `[]`.
         md.push_str(&format!(
-            "# Meeting — {}\n\n",
+            "calendar_matched: {}\n",
+            calendar.is_some()
+        ));
+        md.push_str("source: lark\n");
+        md.push_str("---\n\n");
+
+        md.push_str(&format!(
+            "# {} — {}\n\n",
+            calendar
+                .as_ref()
+                .and_then(|c| c.title.as_deref())
+                .unwrap_or("Meeting"),
             started.format("%A %-d %B %Y, %H:%M")
         ));
         md.push_str(&format!(
-            "- Duration: {} min {} sec\n- Transcribed locally by Lark (meeting mode spike)\n",
+            "- Duration: {} min {} sec\n- Transcribed locally by Lark\n",
             duration_secs / 60,
             duration_secs % 60
         ));
@@ -372,22 +465,119 @@ impl MeetingManager {
                 "- Note: the mic track was almost entirely silent — only the system side was captured. (AirPods handshake? Check the log.)\n",
             );
         }
+        let transcript_body = render_transcript(&entries);
+
+        // AI notes go ABOVE the transcript: the downstream agents (Meeting
+        // Digest, The Surveyor) read summaries, not transcripts — that is how
+        // they consumed Granola, whose free tier never exposed transcripts.
+        match self.meeting_notes(&transcript_body) {
+            Ok(Some(notes)) => {
+                md.push_str("\n## Notes\n\n");
+                md.push_str(notes.trim());
+                md.push_str("\n");
+            }
+            Ok(None) => {}
+            // A failed summary must never cost the transcript.
+            Err(e) => {
+                log::warn!("Meeting notes generation failed: {e}");
+                md.push_str(&format!("\n## Notes\n\n_Not generated: {e}_\n"));
+            }
+        }
+
         md.push_str("\n## Transcript\n\n");
-        if entries.is_empty() {
-            md.push_str("_No speech detected on either track._\n");
-        }
-        for (start, speaker, text) in &entries {
-            let secs = start / SAMPLE_RATE;
-            md.push_str(&format!(
-                "**[{:02}:{:02}] {speaker}:** {text}\n\n",
-                secs / 60,
-                secs % 60
-            ));
-        }
+        md.push_str(&transcript_body);
 
         let md_path = out_dir.join(format!("{stem}.md"));
         std::fs::write(&md_path, md)?;
+        // The transcript is safely on disk — the sidecar has done its job.
+        let _ = std::fs::remove_file(&partial_path);
         Ok(md_path)
+    }
+
+    /// Summary + action items via the existing post-process LLM plumbing.
+    /// Returns `Ok(None)` when the feature is off or unconfigured — that is a
+    /// normal state, not an error, and must not surface as a failure note.
+    fn meeting_notes(&self, transcript: &str) -> Result<Option<String>> {
+        let settings = get_settings(&self.app_handle);
+        if !settings.meeting_notes_enabled || transcript.trim().is_empty() {
+            return Ok(None);
+        }
+
+        let provider = settings
+            .post_process_providers
+            .iter()
+            .find(|p| p.id == settings.post_process_provider_id)
+            .ok_or_else(|| anyhow!("provider {} not found", settings.post_process_provider_id))?
+            .clone();
+        let api_key = settings
+            .post_process_api_keys
+            .get(&provider.id)
+            .cloned()
+            .unwrap_or_default();
+        let model = settings
+            .post_process_models
+            .get(&provider.id)
+            .cloned()
+            .unwrap_or_default();
+        if api_key.is_empty() || model.is_empty() {
+            log::info!(
+                "Meeting notes enabled but {} has no key/model set — skipping",
+                provider.id
+            );
+            return Ok(None);
+        }
+
+        // Spend guard. The DeepSeek key funds all 17 Hermes agents with no
+        // fallback provider, so an unbounded transcript is a real risk to
+        // something other than this app.
+        let cap = settings.meeting_notes_max_chars;
+        let (body, truncated) = if transcript.len() > cap {
+            (&transcript[..cap], true)
+        } else {
+            (transcript, false)
+        };
+        if truncated {
+            log::warn!(
+                "Meeting transcript truncated from {} to {cap} chars for summarisation",
+                transcript.len()
+            );
+        }
+
+        let prompt = format!(
+            "You are summarising a meeting transcript. \"Kole\" is the user; \
+\"Them\" is everyone else on the call — the transcript cannot tell those people apart, so \
+never invent names for them.\n\n\
+Write, in this order and nothing else:\n\
+1. A `### Summary` section: 3-5 plain sentences on what the meeting was about and what was decided.\n\
+2. An `### Action items` section: a markdown checklist (`- [ ] `), each line naming who owns it \
+(Kole, or Them if it is the other side).\n\
+3. An `### Open questions` section only if something was explicitly left unresolved.\n\n\
+Sections 2 and 3 are optional: if there is nothing to put in one, leave the heading out \
+altogether. Never write a heading followed by \"none\" or \"nothing\" — an empty section is \
+noise in a file other tools read.\n\n\
+Rules: use only what is in the transcript — never infer or embellish. \
+Local speech-to-text produces garbled words; read past obvious mistranscriptions rather than \
+quoting them. Write plainly, no jargon, no preamble.{}\n\n\
+Transcript:\n{}",
+            if truncated {
+                "\n\nNote: this transcript was truncated — say so in one line at the end."
+            } else {
+                ""
+            },
+            body
+        );
+
+        // `process()` runs on a plain worker thread, so drive the async call
+        // to completion here rather than leaking async up the call chain.
+        let result = tauri::async_runtime::block_on(async move {
+            crate::llm_client::send_chat_completion(&provider, api_key, &model, prompt, None, None)
+                .await
+        })
+        .map_err(|e| anyhow!(e))?;
+
+        Ok(result
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty()))
     }
 
     /// Same device resolution the dictation pipeline uses, including the
@@ -414,7 +604,165 @@ fn fit_to_length(samples: &mut Vec<f32>, expected: usize) {
     samples.resize(expected, 0.0);
 }
 
-fn meetings_dir() -> Result<PathBuf> {
+/// One JSON object per line, flushed immediately. Deliberately dependency-free
+/// and append-only: the whole point is that a SIGKILL between two segments
+/// leaves everything before it intact and parseable.
+fn append_partial(
+    file: Option<&mut std::fs::File>,
+    start: usize,
+    speaker: &str,
+    text: &str,
+) {
+    use std::io::Write;
+    let Some(file) = file else { return };
+    let line = serde_json::json!({
+        "start": start,
+        "speaker": speaker,
+        "text": text,
+    });
+    if writeln!(file, "{line}").is_err() {
+        return;
+    }
+    // Flush per segment — buffered output would defeat the purpose.
+    let _ = file.flush();
+}
+
+/// Calendar titles are free text and end up in a filename. Strip what the
+/// filesystem or a shell would choke on, collapse whitespace, and keep it
+/// short enough to stay readable in a folder listing.
+fn sanitise_for_filename(title: &str) -> String {
+    let cleaned: String = title
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r' | '\t' => ' ',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Leading dots hide the file; trailing ones confuse extension parsing.
+    let trimmed = collapsed.trim_matches('.').trim();
+    trimmed.chars().take(60).collect::<String>().trim().to_string()
+}
+
+/// Quote a YAML scalar only when it needs it, so the common case stays
+/// readable. Single quotes with doubling is the safest minimal form.
+fn yaml_scalar(value: &str) -> String {
+    let needs_quoting = value.is_empty()
+        || value.starts_with(['-', '?', ':', '&', '*', '!', '|', '>', '\'', '"', '%', '@', '`', '[', '{', '#'])
+        || value.contains(": ")
+        || value.contains(" #")
+        || value.ends_with(':')
+        || value.trim() != value;
+    if needs_quoting {
+        format!("'{}'", value.replace('\'', "''"))
+    } else {
+        value.to_string()
+    }
+}
+
+fn render_transcript(entries: &[(usize, &'static str, String)]) -> String {
+    if entries.is_empty() {
+        return "_No speech detected on either track._\n".to_string();
+    }
+    let mut out = String::new();
+    for (start, speaker, text) in entries {
+        let secs = start / SAMPLE_RATE;
+        out.push_str(&format!(
+            "**[{:02}:{:02}] {speaker}:** {text}\n\n",
+            secs / 60,
+            secs % 60
+        ));
+    }
+    out
+}
+
+/// Rebuild a `.md` from any sidecar left behind by a run that died mid-batch.
+/// Called at startup: a meeting killed by the OOM reaper should cost the user
+/// nothing but the summary. Sidecars whose `.md` already exists are just swept.
+pub fn recover_orphaned_meetings(app_handle: &AppHandle) {
+    let Ok(dir) = meetings_dir_for(app_handle) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.to_string_lossy().ends_with(".partial.jsonl") {
+            continue;
+        }
+        let stem = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.trim_end_matches(".partial.jsonl").to_string());
+        let Some(stem) = stem else { continue };
+        let md_path = dir.join(format!("{stem}.md"));
+        if md_path.exists() {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut lines: Vec<(usize, String, String)> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|v| {
+                Some((
+                    v.get("start")?.as_u64()? as usize,
+                    v.get("speaker")?.as_str()?.to_string(),
+                    v.get("text")?.as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        if lines.is_empty() {
+            continue;
+        }
+        lines.sort_by_key(|(start, _, _)| *start);
+
+        let mut md = format!("# Meeting — {stem}\n\n");
+        md.push_str(
+            "- **Recovered** from a run that ended before the transcript was written. \
+No AI notes, and the mic-bleed dedup pass did not run.\n\n## Transcript\n\n",
+        );
+        for (start, speaker, text) in &lines {
+            let secs = start / SAMPLE_RATE;
+            md.push_str(&format!(
+                "**[{:02}:{:02}] {speaker}:** {text}\n\n",
+                secs / 60,
+                secs % 60
+            ));
+        }
+        match std::fs::write(&md_path, md) {
+            Ok(()) => {
+                log::info!("Recovered orphaned meeting transcript: {}", md_path.display());
+                let _ = std::fs::remove_file(&path);
+            }
+            Err(e) => log::warn!("Failed to write recovered meeting {}: {e}", md_path.display()),
+        }
+    }
+}
+
+/// Where transcripts land. Settings-driven since 2026-08-01 so the folder can
+/// sit inside `~/Documents/Claude/` — the only tree Cowork agents can read,
+/// and the reason the Meeting Digest / Surveyor can consume Lark at all.
+/// Falls back to the historical path if the setting is somehow blank.
+pub fn meetings_dir_for(app_handle: &AppHandle) -> Result<PathBuf> {
+    let configured = get_settings(app_handle).meetings_folder;
+    let trimmed = configured.trim();
+    if !trimmed.is_empty() {
+        // Expand a leading `~` — the setting is user-editable text.
+        if let Some(rest) = trimmed.strip_prefix("~/") {
+            let home = std::env::var("HOME").map_err(|_| anyhow!("HOME not set"))?;
+            return Ok(PathBuf::from(home).join(rest));
+        }
+        return Ok(PathBuf::from(trimmed));
+    }
+    legacy_meetings_dir()
+}
+
+fn legacy_meetings_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME").map_err(|_| anyhow!("HOME not set"))?;
     Ok(PathBuf::from(home).join("Documents").join("Lark Meetings"))
 }
@@ -422,9 +770,8 @@ fn meetings_dir() -> Result<PathBuf> {
 /// Raw meeting audio follows Kole's AudioDay1 dictation policy: keep WAVs
 /// for 24h (debugging window), keep transcripts forever. ~275MB per hour
 /// of meeting on a chronically full disk says delete.
-fn cleanup_old_meeting_wavs() {
-    let Ok(dir) = meetings_dir() else { return };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+fn cleanup_old_meeting_wavs(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     let cutoff = std::time::SystemTime::now() - Duration::from_secs(24 * 3600);

@@ -111,11 +111,28 @@ function App() {
         toast.error(t("errors.noInputDeviceTitle"), {
           description: t("errors.noInputDevice"),
         });
+      } else if (error_type === "transcription_timeout") {
+        toast.error(t("errors.transcriptionTimeoutTitle"), {
+          description: t("errors.transcriptionTimeout"),
+        });
       } else {
         toast.error(
           t("errors.recordingFailed", { error: detail ?? "Unknown error" }),
         );
       }
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [t]);
+
+  // Listen for the startup low-disk warning and show a toast.
+  useEffect(() => {
+    const unlisten = listen<{ free_mb: number }>("low-disk-warning", (event) => {
+      toast.warning(t("errors.lowDiskTitle"), {
+        description: t("errors.lowDisk", { freeMb: event.payload.free_mb }),
+        duration: 10000,
+      });
     });
     return () => {
       unlisten.then((fn) => fn());
@@ -156,6 +173,20 @@ function App() {
       unlisten.then((fn) => fn());
     };
   }, [t]);
+
+  // Jump to a settings section when asked from another window — e.g. the
+  // recording overlay's red "NO AUDIO" indicator deep-links here to Microphone.
+  useEffect(() => {
+    const unlisten = listen<{ section: SidebarSection }>(
+      "navigate-to-section",
+      (event) => {
+        setCurrentSection(event.payload.section);
+      },
+    );
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
 
   const revealMainWindowForPermissions = async () => {
     try {

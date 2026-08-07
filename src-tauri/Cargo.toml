@@ -54,7 +54,7 @@ rubato = "0.16.2"
 hound = "3.5.1"
 log = "0.4.25"
 env_filter = "0.1.0"
-tokio = "1.43.0"
+tokio = { version = "1.43.0", features = ["time"] }
 vad-rs = { git = "https://github.com/cjpais/vad-rs", default-features = false }
 enigo = "0.6.1"
 rodio = { git = "https://github.com/cjpais/rodio.git" }
@@ -104,6 +104,20 @@ tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", branch = "v2.
 transcribe-rs = { version = "0.3.3", features = ["whisper-metal"] }
 window-vibrancy = "0.6.0"
 cidre = { version = "0.15.0", features = ["av"] }
+# EventKit, for naming a meeting after the calendar event it overlaps.
+# Pure Rust bindings — no Swift, so this doesn't need the full Xcode that
+# forced Apple Intelligence to be stubbed out in build.rs.
+objc2 = "0.6"
+objc2-foundation = "0.3"
+block2 = "0.6"
+objc2-event-kit = { version = "0.3", features = [
+    "EKCalendarItem",
+    "EKEvent",
+    "EKEventStore",
+    "EKParticipant",
+    "EKStructuredLocation",
+    "block2",
+] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk-layer-shell = { version = "0.8", features = ["v0_6"] }

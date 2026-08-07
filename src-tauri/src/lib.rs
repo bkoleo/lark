@@ -9,6 +9,7 @@ mod commands;
 mod helpers;
 mod input;
 mod llm_client;
+mod maintenance;
 mod managers;
 mod overlay;
 pub mod portable;
@@ -171,6 +172,10 @@ fn initialize_core_logic(app_handle: &AppHandle) {
         app_handle.manage(meeting_manager);
         managers::meeting_detect::spawn_meeting_detector(app_handle);
     }
+
+    // Startup maintenance: warn on low disk and recover any recordings whose
+    // transcription never completed (see maintenance.rs).
+    maintenance::spawn_startup_maintenance(app_handle.clone());
 
     // Note: Shortcuts are NOT initialized here.
     // The frontend is responsible for calling the `initialize_shortcuts` command

@@ -1,4 +1,4 @@
-import { listen } from "@tauri-apps/api/event";
+import { listen, emit } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalPosition } from "@tauri-apps/api/window";
 import React, { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -198,6 +198,9 @@ const RecordingOverlay: React.FC = () => {
 
   const startDrag = async (e: React.PointerEvent) => {
     if ((e.target as HTMLElement).closest(".cancel-button")) return;
+    // The clickable "NO AUDIO" status deep-links to settings — don't start a
+    // drag from it.
+    if ((e.target as HTMLElement).closest(".mic-status-clickable")) return;
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     const win = getCurrentWindow();
     const [pos, scale] = await Promise.all([
@@ -267,10 +270,12 @@ const RecordingOverlay: React.FC = () => {
                   key={i}
                   className="bar"
                   style={{
-                    height: `${Math.min(20, 4 + Math.pow(v, 0.7) * 16)}px`, // Cap at 20px max height
+                    // Tuned to match the more sensitive Rust mapping so quiet
+                    // speech clearly fills the bars; silence stays a flat ~2px.
+                    height: `${Math.min(20, 2 + Math.pow(v, 0.6) * 18)}px`,
                     transition:
                       "height 60ms ease-out, opacity 120ms ease-out",
-                    opacity: Math.max(0.2, v * 1.7), // Minimum opacity for visibility
+                    opacity: Math.max(0.25, v * 1.9), // Minimum opacity for visibility
                   }}
                 />
               ))}
@@ -305,7 +310,22 @@ const RecordingOverlay: React.FC = () => {
       </div>
 
       {state === "recording" && (
-        <div className={`mic-status-line ${micStatus}`}>
+        <div
+          className={`mic-status-line ${micStatus} ${
+            micStatus === "silent" ? "mic-status-clickable" : ""
+          }`}
+          style={micStatus === "silent" ? { cursor: "pointer" } : undefined}
+          onClick={
+            micStatus === "silent"
+              ? () => {
+                  // Deep-link to the Microphone section so the user can pick the
+                  // right input the moment Lark warns it hears nothing.
+                  emit("navigate-to-section", { section: "microphone" });
+                  commands.showMainWindowCommand();
+                }
+              : undefined
+          }
+        >
           {getMicStatusText()}
         </div>
       )}

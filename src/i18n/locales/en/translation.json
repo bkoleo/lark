@@ -13,10 +13,11 @@
   },
   "sidebar": {
     "general": "General",
+    "microphone": "Microphone",
     "models": "Models",
     "advanced": "Advanced",
     "postProcessing": "Post Process",
-    "history": "History",
+    "history": "Transcription",
     "debug": "Debug",
     "about": "About",
     "meetings": "Meetings"
@@ -423,7 +424,7 @@
       }
     },
     "history": {
-      "title": "History",
+      "title": "Transcription",
       "openFolder": "Open Recordings Folder",
       "loading": "Loading history...",
       "empty": "No transcriptions yet. Start recording to build your history!",
@@ -604,7 +605,11 @@
     "modelLoadFailed": "Failed to load model: {{model}}",
     "modelLoadFailedUnknown": "unknown model",
     "pasteFailedTitle": "Failed to Paste Text",
-    "pasteFailed": "Text could not be pasted into the active application."
+    "pasteFailed": "Text could not be pasted into the active application.",
+    "transcriptionTimeoutTitle": "Transcription Timed Out",
+    "transcriptionTimeout": "That recording took too long to transcribe and was stopped. Your audio was saved — try again, or free up disk space if this keeps happening.",
+    "lowDiskTitle": "Low Disk Space",
+    "lowDisk": "Only {{freeMb}} MB free. Transcription can stall when the disk is this full — free up some space."
   },
   "appLanguage": {
     "title": "Application Language",
@@ -630,7 +635,9 @@
     "detected": "Meeting detected",
     "ended": "Call ended",
     "dismiss": "Dismiss",
-    "recording": "Recording meeting"
+    "recording": "Recording meeting",
+    "savedTitle": "Meeting recorded successfully",
+    "savedSubtitle": "Notes saved to your Meetings"
   },
   "meetings": {
     "searchPlaceholder": "Search meetings…",

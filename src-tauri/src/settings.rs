@@ -405,6 +405,22 @@ pub struct AppSettings {
     pub post_process_prompts: Vec<LLMPrompt>,
     #[serde(default)]
     pub post_process_selected_prompt_id: Option<String>,
+    /// Generate an AI summary + action items at the top of each meeting
+    /// transcript. Deliberately separate from `post_process_enabled`, which
+    /// governs dictation cleanup — wanting one does not imply the other.
+    /// Uses the same provider / key / model settings as post-processing.
+    #[serde(default)]
+    pub meeting_notes_enabled: bool,
+    /// Hard ceiling on transcript characters sent per summary request. The
+    /// DeepSeek key funds the whole Hermes agent roster with no fallback, so
+    /// a runaway meeting must not be able to drain it.
+    #[serde(default = "default_meeting_notes_max_chars")]
+    pub meeting_notes_max_chars: usize,
+    /// Where meeting transcripts are written. Defaults inside
+    /// `~/Documents/Claude/` so Cowork agents can actually read them — their
+    /// sandbox mounts only that folder.
+    #[serde(default = "default_meetings_folder")]
+    pub meetings_folder: String,
     #[serde(default)]
     pub mute_while_recording: bool,
     #[serde(default)]
@@ -527,6 +543,20 @@ fn default_post_process_provider_id() -> String {
     "openai".to_string()
 }
 
+/// ~80k chars ≈ a 3-hour meeting. Longer than that gets truncated rather
+/// than refused: a partial summary beats none, and the cap is a spend guard.
+fn default_meeting_notes_max_chars() -> usize {
+    80_000
+}
+
+/// `~/Documents/Claude/Meetings` — inside the Cowork mount on purpose.
+/// Falls back to the literal path if HOME is unset (never in practice).
+fn default_meetings_folder() -> String {
+    std::env::var("HOME")
+        .map(|h| format!("{h}/Documents/Claude/Meetings"))
+        .unwrap_or_else(|_| "~/Documents/Claude/Meetings".to_string())
+}
+
 fn default_post_process_providers() -> Vec<PostProcessProvider> {
     let mut providers = vec![
         PostProcessProvider {
@@ -576,6 +606,16 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             allow_base_url_edit: false,
             models_endpoint: Some("/models".to_string()),
             supports_structured_output: true,
+        },
+        // OpenAI-compatible chat/completions; cheap enough that meeting
+        // summaries cost a fraction of a cent per call.
+        PostProcessProvider {
+            id: "deepseek".to_string(),
+            label: "DeepSeek".to_string(),
+            base_url: "https://api.deepseek.com/v1".to_string(),
+            allow_base_url_edit: false,
+            models_endpoint: Some("/models".to_string()),
+            supports_structured_output: false,
         },
     ];
 
@@ -806,6 +846,9 @@ pub fn get_default_settings() -> AppSettings {
         post_process_models: default_post_process_models(),
         post_process_prompts: default_post_process_prompts(),
         post_process_selected_prompt_id: None,
+        meeting_notes_enabled: false,
+        meeting_notes_max_chars: default_meeting_notes_max_chars(),
+        meetings_folder: default_meetings_folder(),
         mute_while_recording: false,
         append_trailing_space: false,
         app_language: default_app_language(),

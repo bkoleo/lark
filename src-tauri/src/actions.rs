@@ -643,9 +643,44 @@ impl ShortcutAction for TranscribeAction {
                         crate::audio_toolkit::save_wav_file(&wav_path, &samples_for_wav)
                     });
 
-                    // Transcribe concurrently with WAV save
+                    // Transcribe concurrently with WAV save.
+                    //
+                    // Run on a blocking thread guarded by a timeout. Without this,
+                    // a wedged transcription (e.g. swap thrash when the disk is
+                    // nearly full on a low-RAM Mac) freezes the app forever: the
+                    // overlay never hides and no further dictation works. The
+                    // timeout aborts cleanly instead — the WAV is kept on disk and
+                    // picked up by startup recovery (see maintenance.rs).
                     let transcription_time = Instant::now();
-                    let transcription_result = tm.transcribe(samples);
+                    let speed = crate::managers::transcription::TRANSCRIBE_SPEED_X100
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .max(100) as u64;
+                    let est_secs = (audio_secs * 100 / speed).max(2);
+                    // Generous headroom (6x the estimate, floor 90s) so genuinely
+                    // long dictations never trip it — only a true hang does.
+                    let timeout_secs = (est_secs * 6).max(90);
+                    let tm_for_blocking = Arc::clone(&tm);
+                    let transcribe_handle = tauri::async_runtime::spawn_blocking(move || {
+                        tm_for_blocking.transcribe(samples)
+                    });
+                    let transcription_result = match tokio::time::timeout(
+                        std::time::Duration::from_secs(timeout_secs),
+                        transcribe_handle,
+                    )
+                    .await
+                    {
+                        Ok(Ok(res)) => res,
+                        Ok(Err(join_err)) => {
+                            Err(anyhow::anyhow!("Transcription task panicked: {join_err}"))
+                        }
+                        Err(_elapsed) => {
+                            warn!(
+                                "Transcription timed out after {}s ({}s of audio) — aborting; WAV kept for startup recovery",
+                                timeout_secs, audio_secs
+                            );
+                            Err(anyhow::anyhow!("transcription_timeout"))
+                        }
+                    };
 
                     // Await WAV save and verify
                     let wav_saved = match wav_handle.await {
@@ -728,8 +763,14 @@ impl ShortcutAction for TranscribeAction {
                             }
                         }
                         Err(err) => {
-                            debug!("Global Shortcut Transcription error: {}", err);
-                            // Save entry with empty text so user can retry
+                            let is_timeout = err.to_string().contains("transcription_timeout");
+                            if is_timeout {
+                                warn!("Transcription aborted (timeout); notifying user, WAV retained for recovery");
+                            } else {
+                                debug!("Global Shortcut Transcription error: {}", err);
+                            }
+                            // Save entry with empty text so the user can retry and
+                            // startup recovery can find the WAV.
                             if wav_saved {
                                 if let Err(save_err) = hm.save_entry(
                                     file_name,
@@ -740,6 +781,18 @@ impl ShortcutAction for TranscribeAction {
                                 ) {
                                     error!("Failed to save failed history entry: {}", save_err);
                                 }
+                            }
+                            if is_timeout {
+                                // Reuse the recording-error toast pipeline (works in
+                                // release builds — no new typed command/binding).
+                                let _ = ah.emit(
+                                    "recording-error",
+                                    RecordingErrorEvent {
+                                        error_type: "transcription_timeout".to_string(),
+                                        detail: None,
+                                    },
+                                );
+                                play_feedback_sound(&ah, SoundType::Stop);
                             }
                             utils::hide_recording_overlay(&ah);
                             change_tray_icon(&ah, TrayIconState::Idle);

@@ -6,5 +6,9 @@
   <string>Request microphone access to transcribe audio locally</string>
   <key>NSAudioCaptureUsageDescription</key>
   <string>Capture system audio during meetings so the other participants can be transcribed locally</string>
+  <key>NSCalendarsUsageDescription</key>
+  <string>Read the calendar event a recording overlaps, so meeting notes can be named after it</string>
+  <key>NSCalendarsFullAccessUsageDescription</key>
+  <string>Read the calendar event a recording overlaps, so meeting notes can be named after it</string>
 </dict>
 </plist>
