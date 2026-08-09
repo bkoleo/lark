@@ -3,6 +3,57 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use strsim::levenshtein;
 
+/// Ordinary English words, one per line, lowercase, byte-wise sorted.
+///
+/// Source: dwyl/english-words (`words_alpha.txt`), which is released into the
+/// public domain under the Unlicense, filtered to purely alphabetic entries of
+/// two characters or more. Used only to recognise real words — see
+/// [`find_best_match`] for why that matters.
+static ENGLISH_WORDS: &str = include_str!("english_words.txt");
+
+/// Strips surrounding punctuation from a word and lowercases it.
+fn clean_word(word: &str) -> String {
+    word.trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase()
+}
+
+/// Returns true if `word` is an ordinary English word.
+///
+/// Binary search over the sorted static list, so this costs no heap and no
+/// startup work. Input must already be lowercased (see [`clean_word`]);
+/// anything non-ASCII or shorter than two characters is not treated as a word,
+/// which keeps single letters ("Chat G P T") available for n-gram matching.
+fn is_english_word(word: &str) -> bool {
+    if word.len() < 2 || !word.bytes().all(|b| b.is_ascii_lowercase()) {
+        return false;
+    }
+
+    let data = ENGLISH_WORDS.as_bytes();
+    let (mut lo, mut hi) = (0usize, data.len());
+
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        // Widen `mid` to the line that contains it.
+        let start = data[lo..mid]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(lo, |p| lo + p + 1);
+        let end = data[mid..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(data.len(), |p| mid + p);
+
+        match data[start..end].cmp(word.as_bytes()) {
+            std::cmp::Ordering::Equal => return true,
+            // Every candidate line is at or past `end`; +1 steps over the newline.
+            std::cmp::Ordering::Less => lo = end + 1,
+            std::cmp::Ordering::Greater => hi = start,
+        }
+    }
+
+    false
+}
+
 /// Builds an n-gram string by cleaning and concatenating words
 ///
 /// Strips punctuation from each word, lowercases, and joins without spaces.
@@ -10,10 +61,7 @@ use strsim::levenshtein;
 fn build_ngram(words: &[&str]) -> String {
     words
         .iter()
-        .map(|w| {
-            w.trim_matches(|c: char| !c.is_alphanumeric())
-                .to_lowercase()
-        })
+        .map(|w| clean_word(w))
         .collect::<Vec<_>>()
         .concat()
 }
@@ -23,8 +71,19 @@ fn build_ngram(words: &[&str]) -> String {
 /// Uses Levenshtein distance and Soundex phonetic matching to find
 /// the best match above the given threshold.
 ///
+/// Speech that is already ordinary English is never rewritten, no matter how
+/// close the score: short brand names rhyme with common words, and no threshold
+/// separates the two. With Kole's list, "will" scored 0.120 against "Wilow",
+/// "cloud" 0.100 against "Claude" and "lurk" 0.075 against "Lark" — all *better*
+/// than genuine corrections, so tightening the threshold loses the real fixes
+/// first. Adjacent words fuse the same way ("and traffic" scores 0.15 against
+/// "Anthropic"), so an n-gram is protected when every word in it is English.
+/// An exact match still applies, which is what keeps case and spacing fixes
+/// working ("lark" -> "Lark", "mac book pro" -> "MacBook Pro").
+///
 /// # Arguments
 /// * `candidate` - The cleaned/lowercased candidate string to match
+/// * `ngram_words` - The original words the candidate was built from
 /// * `custom_words` - Original custom words (for returning the replacement)
 /// * `custom_words_nospace` - Custom words with spaces removed, lowercased (for comparison)
 /// * `threshold` - Maximum similarity score to accept
@@ -33,6 +92,7 @@ fn build_ngram(words: &[&str]) -> String {
 /// The best matching custom word and its score, if any match was found
 fn find_best_match<'a>(
     candidate: &str,
+    ngram_words: &[&str],
     custom_words: &'a [String],
     custom_words_nospace: &[String],
     threshold: f64,
@@ -41,10 +101,19 @@ fn find_best_match<'a>(
         return None;
     }
 
+    let speech_is_english = ngram_words
+        .iter()
+        .all(|word| is_english_word(&clean_word(word)));
+
     let mut best_match: Option<&String> = None;
     let mut best_score = f64::MAX;
 
     for (i, custom_word_nospace) in custom_words_nospace.iter().enumerate() {
+        // Real English: only an exact match may replace it.
+        if speech_is_english && candidate != custom_word_nospace {
+            continue;
+        }
+
         // Skip if lengths are too different (optimization + prevents over-matching)
         // Use percentage-based check: max 25% length difference (prevents n-grams from
         // matching significantly shorter custom words, e.g., "openaigpt" vs "openai")
@@ -129,9 +198,13 @@ pub fn apply_custom_words(text: &str, custom_words: &[String], threshold: f64) -
             let ngram_words = &words[i..i + n];
             let ngram = build_ngram(ngram_words);
 
-            if let Some((replacement, _score)) =
-                find_best_match(&ngram, custom_words, &custom_words_nospace, threshold)
-            {
+            if let Some((replacement, _score)) = find_best_match(
+                &ngram,
+                ngram_words,
+                custom_words,
+                &custom_words_nospace,
+                threshold,
+            ) {
                 // Extract punctuation from first and last words of the n-gram
                 let (prefix, _) = extract_punctuation(ngram_words[0]);
                 let (_, suffix) = extract_punctuation(ngram_words[n - 1]);
@@ -548,6 +621,91 @@ mod tests {
         let custom_words = vec!["MacBook Pro".to_string()];
         let result = apply_custom_words(text, &custom_words, 0.5);
         assert!(result.contains("MacBook"));
+    }
+
+    /// Kole's real custom-word list, which is what exposed the bug.
+    fn kole_words() -> Vec<String> {
+        [
+            "Claude",
+            "Wilow",
+            "Cowork",
+            "Lark",
+            "Anthropic",
+            "Ekene",
+            "hormozi",
+            "Hermes",
+        ]
+        .iter()
+        .map(|w| w.to_string())
+        .collect()
+    }
+
+    #[test]
+    fn test_is_english_word_binary_search() {
+        // First and last entries in the list, to prove the search reaches both ends.
+        assert!(is_english_word("aa"));
+        assert!(is_english_word("zyzzyvas"));
+        for word in [
+            "will", "cloud", "large", "lurk", "heroes", "willow", "traffic",
+        ] {
+            assert!(is_english_word(word), "{word} should be English");
+        }
+        for word in ["wilow", "hormozi", "ekene", "zzzzqq"] {
+            assert!(!is_english_word(word), "{word} should not be English");
+        }
+        // "anthropic" is itself an English word; the exact-match escape is what
+        // keeps that custom word working at all.
+        assert!(is_english_word("anthropic"));
+        // Too short, or not lowercase ASCII, is never treated as a word.
+        assert!(!is_english_word("a"));
+        assert!(!is_english_word("b"));
+        assert!(!is_english_word("Will"));
+        assert!(!is_english_word(""));
+    }
+
+    #[test]
+    fn test_custom_words_do_not_rewrite_ordinary_english() {
+        // The regression: every one of these scored below the 0.18 threshold and
+        // was silently replaced, corrupting transcripts and dictations alike.
+        let text = "it will show me all the ads and this will be another section \
+                    in the cloud with a large heroes willow lurk";
+        let result = apply_custom_words(text, &kole_words(), 0.18);
+        assert_eq!(result, text, "ordinary English must survive untouched");
+    }
+
+    #[test]
+    fn test_custom_words_do_not_fuse_adjacent_english() {
+        // "and traffic" scored 0.15 against "Anthropic" as a fused n-gram.
+        for text in ["and traffic", "an tropic", "her mess", "will oh"] {
+            let result = apply_custom_words(text, &kole_words(), 0.18);
+            assert_eq!(result, text, "{text} must not fuse into a custom word");
+        }
+    }
+
+    #[test]
+    fn test_custom_words_still_correct_mistranscriptions() {
+        // Non-words the recogniser actually produces still get fixed.
+        for (spoken, expected) in [
+            ("clawd", "Claude"),
+            ("wilo", "Wilow"),
+            ("anthropik", "Anthropic"),
+            ("hermez", "Hermes"),
+            ("hormozy", "hormozi"),
+        ] {
+            let result = apply_custom_words(spoken, &kole_words(), 0.18);
+            assert_eq!(result, expected, "{spoken} should correct to {expected}");
+        }
+    }
+
+    #[test]
+    fn test_custom_words_exact_match_beats_the_guard() {
+        // "lark" is an English word, but an exact match is still a case fix.
+        assert_eq!(apply_custom_words("lark", &kole_words(), 0.18), "Lark");
+        assert_eq!(apply_custom_words("claude", &kole_words(), 0.18), "Claude");
+        // And a spaced multi-word entry still joins up.
+        let custom = vec!["MacBook Pro".to_string()];
+        let result = apply_custom_words("using mac book pro", &custom, 0.5);
+        assert!(result.contains("MacBook Pro"), "got {result}");
     }
 
     #[test]
