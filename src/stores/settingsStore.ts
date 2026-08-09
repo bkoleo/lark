@@ -145,6 +145,8 @@ const settingUpdaters: {
     commands.changeLazyStreamCloseSetting(value as boolean),
   show_tray_icon: (value) =>
     commands.changeShowTrayIconSetting(value as boolean),
+  show_next_meeting: (value) =>
+    commands.changeShowNextMeetingSetting(value as boolean),
   whisper_accelerator: (value) =>
     commands.changeWhisperAcceleratorSetting(
       value as WhisperAcceleratorSetting,

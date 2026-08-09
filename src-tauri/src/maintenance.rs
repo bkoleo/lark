@@ -139,10 +139,12 @@ fn recover_orphaned_recordings(app: &AppHandle, recordings_dir: &Path) {
     wavs.sort_by(|a, b| b.1.cmp(&a.1));
 
     // Keep only WAVs that still need recovery (no non-empty-text history row).
-    wavs.retain(|(path, _)| match path.file_name().and_then(|s| s.to_str()) {
-        Some(fname) => !matches!(by_file.get(fname), Some((_, true))),
-        None => false,
-    });
+    wavs.retain(
+        |(path, _)| match path.file_name().and_then(|s| s.to_str()) {
+            Some(fname) => !matches!(by_file.get(fname), Some((_, true))),
+            None => false,
+        },
+    );
     if wavs.is_empty() {
         return;
     }
@@ -178,7 +180,10 @@ fn recover_orphaned_recordings(app: &AppHandle, recordings_dir: &Path) {
         // Never re-trigger the very thrash we're guarding against.
         if let Some(free) = free_bytes_at(recordings_dir) {
             if free < LOW_DISK_BYTES {
-                warn!("Recovery paused: low disk; leaving {} for next launch", fname);
+                warn!(
+                    "Recovery paused: low disk; leaving {} for next launch",
+                    fname
+                );
                 break;
             }
         }
@@ -205,7 +210,9 @@ fn recover_orphaned_recordings(app: &AppHandle, recordings_dir: &Path) {
                     // Empty-text row from an aborted run → fill it in.
                     Some((id, _)) => hm.update_transcription(*id, text, None, None).map(|_| ()),
                     // No row at all → create one (not auto-pasted).
-                    None => hm.save_entry(fname.clone(), text, false, None, None).map(|_| ()),
+                    None => hm
+                        .save_entry(fname.clone(), text, false, None, None)
+                        .map(|_| ()),
                 };
                 match result {
                     Ok(()) => {

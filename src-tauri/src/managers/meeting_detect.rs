@@ -80,7 +80,10 @@ fn pid_executable_path(pid: i32) -> Option<String> {
 
 fn match_meeting_app(bundle_id: Option<&str>, path: Option<&str>) -> Option<&'static str> {
     if let Some(bid) = bundle_id {
-        if let Some((_, name)) = MEETING_APPS.iter().find(|(prefix, _)| bid.starts_with(prefix)) {
+        if let Some((_, name)) = MEETING_APPS
+            .iter()
+            .find(|(prefix, _)| bid.starts_with(prefix))
+        {
             return Some(name);
         }
     }

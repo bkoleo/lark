@@ -12,6 +12,7 @@ import { ModelUnloadTimeoutSetting } from "../ModelUnloadTimeout";
 import { StartHidden } from "../StartHidden";
 import { AutostartToggle } from "../AutostartToggle";
 import { ShowTrayIcon } from "../ShowTrayIcon";
+import { ShowNextMeeting } from "../ShowNextMeeting";
 import { PasteMethodSetting } from "../PasteMethod";
 import { TypingToolSetting } from "../TypingTool";
 import { ClipboardHandlingSetting } from "../ClipboardHandling";
@@ -34,6 +35,7 @@ export const GeneralSettings: React.FC = () => {
   const pushToTalk = getSetting("push_to_talk");
   const experimentalEnabled = getSetting("experimental_enabled") || false;
   const isLinux = type() === "linux";
+  const isMacos = type() === "macos";
   return (
     <div className="max-w-3xl w-full mx-auto space-y-6">
       <SettingsGroup title={t("settings.general.title")}>
@@ -53,6 +55,10 @@ export const GeneralSettings: React.FC = () => {
         <StartHidden descriptionMode="tooltip" grouped={true} />
         <AutostartToggle descriptionMode="tooltip" grouped={true} />
         <ShowTrayIcon descriptionMode="tooltip" grouped={true} />
+        {/* The menu bar title only exists on macOS. */}
+        {isMacos && (
+          <ShowNextMeeting descriptionMode="tooltip" grouped={true} />
+        )}
         <ShowOverlay descriptionMode="tooltip" grouped={true} />
         <ModelUnloadTimeoutSetting descriptionMode="tooltip" grouped={true} />
         <ExperimentalToggle descriptionMode="tooltip" grouped={true} />

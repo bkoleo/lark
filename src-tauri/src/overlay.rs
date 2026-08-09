@@ -497,7 +497,11 @@ pub fn create_meeting_prompt_window(app_handle: &AppHandle) {
         // not activate the app (see create_recording_overlay).
         .style_mask(StyleMask::empty().borderless().nonactivating_panel())
         .corner_radius(0.0)
-        .with_window(|w| w.decorations(false).transparent(true).accept_first_mouse(true))
+        .with_window(|w| {
+            w.decorations(false)
+                .transparent(true)
+                .accept_first_mouse(true)
+        })
         .collection_behavior(
             CollectionBehavior::new()
                 .can_join_all_spaces()

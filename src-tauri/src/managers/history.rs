@@ -401,7 +401,10 @@ impl HistoryManager {
         }
 
         if purged > 0 {
-            debug!("Purged audio from {} history entries older than 24h", purged);
+            debug!(
+                "Purged audio from {} history entries older than 24h",
+                purged
+            );
         }
         Ok(())
     }

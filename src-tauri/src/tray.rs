@@ -85,6 +85,121 @@ pub fn tray_tooltip() -> String {
     version_label()
 }
 
+/// How long a title can get before it starts pushing the clock off the screen.
+/// The menu bar has no scrollbar and no overflow — it silently eats whatever
+/// sits to the left of the offender, so this is a hard budget, not a hint.
+#[cfg(target_os = "macos")]
+const MAX_TITLE_CHARS: usize = 24;
+
+/// The next meeting, rendered for the menu bar.
+///
+/// Under an hour it counts down, because that is when the number changes what
+/// you do. Beyond that a countdown is just a clock with extra steps, so it
+/// becomes the start time.
+///
+/// A clear day says so out loud rather than going blank. Blank is ambiguous
+/// between "nothing left" and "this feature is broken", and the whole value of
+/// a menu bar item is being able to trust it at a glance — so the only states
+/// that render nothing are the setting being off and calendar access being
+/// unavailable, neither of which is a claim about the day.
+#[cfg(target_os = "macos")]
+pub fn next_meeting_label(app: &AppHandle) -> String {
+    use crate::managers::meeting_calendar::NextMeeting;
+
+    let settings = settings::get_settings(app);
+    if !settings.show_next_meeting {
+        return String::new();
+    }
+
+    match crate::managers::meeting_calendar::next_meeting() {
+        NextMeeting::Upcoming(event) => format_meeting_label(&event),
+        NextMeeting::Clear => get_tray_translations(Some(settings.app_language)).meetings_done,
+        NextMeeting::Unavailable => String::new(),
+    }
+}
+
+/// Split from the EventKit lookup so the wording is testable without a calendar.
+#[cfg(target_os = "macos")]
+fn format_meeting_label(event: &crate::managers::meeting_calendar::UpcomingEvent) -> String {
+    let title = truncate_title(&event.title);
+    if event.starts_in_secs <= 0 {
+        format!("now · {}", title)
+    } else if event.starts_in_secs < 60 * 60 {
+        // Round up: with 90 seconds left, "in 2m" is honest and "in 1m" is not.
+        let minutes = (event.starts_in_secs + 59) / 60;
+        format!("in {}m · {}", minutes, title)
+    } else {
+        format!("{} {}", event.start_hm, title)
+    }
+}
+
+/// Truncate on character boundaries, never bytes — an accented name or an emoji
+/// in a meeting title would panic a byte slice.
+#[cfg(target_os = "macos")]
+fn truncate_title(title: &str) -> String {
+    let title = title.trim();
+    if title.chars().count() <= MAX_TITLE_CHARS {
+        return title.to_string();
+    }
+    let kept: String = title.chars().take(MAX_TITLE_CHARS - 1).collect();
+    format!("{}…", kept.trim_end())
+}
+
+/// Push the current label to the menu bar, skipping the call when nothing has
+/// changed. The label only moves once a minute at most, so the overwhelming
+/// majority of ticks are no-ops.
+#[cfg(target_os = "macos")]
+pub fn refresh_next_meeting(app: &AppHandle) {
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<String>> = Mutex::new(None);
+
+    let label = next_meeting_label(app);
+
+    let mut last = match LAST.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if last.as_deref() == Some(label.as_str()) {
+        return;
+    }
+    *last = Some(label.clone());
+    drop(last);
+
+    // Only fires on a change, so this is a handful of lines a day. Worth it:
+    // a blank menu bar is ambiguous between "clear diary", "permission denied"
+    // and "broken", and this is the only thing that tells them apart.
+    if label.is_empty() {
+        info!("Next meeting: hidden (setting off, or no calendar access)");
+    } else {
+        info!("Next meeting: {}", label);
+    }
+
+    let Some(tray) = app.try_state::<TrayIcon>() else {
+        return;
+    };
+    let result = if label.is_empty() {
+        tray.set_title(None::<&str>)
+    } else {
+        tray.set_title(Some(&label))
+    };
+    if let Err(e) = result {
+        warn!("Failed to set menu bar meeting label: {}", e);
+    }
+}
+
+/// Keep the menu bar label current.
+///
+/// Thirty seconds against a minute-granularity countdown means the number is
+/// never more than half a minute stale, and an EventKit read of one day's
+/// events is cheap enough that the tighter loop costs nothing worth saving.
+#[cfg(target_os = "macos")]
+pub fn start_next_meeting_updates(app: AppHandle) {
+    std::thread::spawn(move || loop {
+        refresh_next_meeting(&app);
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    });
+}
+
 fn version_label() -> String {
     if cfg!(debug_assertions) {
         format!("Lark v{} (Dev)", env!("CARGO_PKG_VERSION"))
@@ -319,5 +434,105 @@ mod tests {
     fn falls_back_to_raw_transcription() {
         let entry = build_entry("raw", None);
         assert_eq!(last_transcript_text(&entry), "raw");
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod next_meeting_tests {
+    use super::*;
+    use crate::managers::meeting_calendar::UpcomingEvent;
+
+    fn event(starts_in_secs: i64, title: &str) -> UpcomingEvent {
+        UpcomingEvent {
+            title: title.to_string(),
+            starts_in_secs,
+            start_hm: "14:30".to_string(),
+        }
+    }
+
+    #[test]
+    fn counts_down_within_the_hour() {
+        assert_eq!(
+            format_meeting_label(&event(8 * 60, "Elizabeth 1:1")),
+            "in 8m · Elizabeth 1:1"
+        );
+    }
+
+    #[test]
+    fn rounds_the_countdown_up() {
+        // 90s left is nearer two minutes than one, and never overstates the time
+        // remaining.
+        assert_eq!(
+            format_meeting_label(&event(90, "Standup")),
+            "in 2m · Standup"
+        );
+        assert_eq!(
+            format_meeting_label(&event(1, "Standup")),
+            "in 1m · Standup"
+        );
+    }
+
+    #[test]
+    fn shows_the_clock_time_beyond_an_hour() {
+        assert_eq!(
+            format_meeting_label(&event(60 * 60, "Elizabeth 1:1")),
+            "14:30 Elizabeth 1:1"
+        );
+    }
+
+    #[test]
+    fn marks_a_meeting_already_under_way() {
+        assert_eq!(format_meeting_label(&event(0, "Standup")), "now · Standup");
+        assert_eq!(
+            format_meeting_label(&event(-120, "Standup")),
+            "now · Standup"
+        );
+    }
+
+    #[test]
+    fn truncates_a_long_title_without_splitting_a_character() {
+        let label = format_meeting_label(&event(300, "Quarterly planning and roadmap review"));
+        assert_eq!(label, "in 5m · Quarterly planning and…");
+        // The budget is on the title, not the whole label.
+        assert_eq!(label.chars().filter(|c| *c == '…').count(), 1);
+    }
+
+    #[test]
+    fn multibyte_titles_do_not_panic() {
+        // A byte slice at the same offset would split the é and panic.
+        let title = "Réunion générale avec l'équipe entière";
+        let label = format_meeting_label(&event(300, title));
+        assert!(label.starts_with("in 5m · Réunion"));
+        assert!(label.ends_with('…'));
+    }
+
+    #[test]
+    fn short_titles_are_left_alone() {
+        assert_eq!(
+            format_meeting_label(&event(300, "  Standup  ")),
+            "in 5m · Standup"
+        );
+    }
+
+    #[test]
+    fn a_clear_day_says_so_and_is_translated() {
+        // The reassurance only works if it is actually present in the strings
+        // the tray renders from — an empty one would show as a blank menu bar,
+        // which is the state it exists to rule out.
+        let strings = get_tray_translations(Some("en-US".to_string()));
+        assert_eq!(strings.meetings_done, "Meetings done");
+    }
+
+    #[test]
+    fn locales_without_the_key_fall_back_to_english() {
+        // Spanish has no tray translations for the meeting entries. It must
+        // render the English word, never an invisible empty string.
+        let es = get_tray_translations(Some("es".to_string()));
+        assert_eq!(es.meetings_done, "Meetings done");
+        assert!(!es.meeting_start.is_empty());
+        assert!(!es.meeting_stop.is_empty());
+        assert!(!es.meeting_processing.is_empty());
+        // Keys Spanish *does* translate must stay Spanish.
+        assert_ne!(es.quit, get_tray_translations(Some("en".to_string())).quit);
     }
 }

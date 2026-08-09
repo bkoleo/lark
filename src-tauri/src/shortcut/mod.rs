@@ -1097,6 +1097,21 @@ pub fn change_show_tray_icon_setting(app: AppHandle, enabled: bool) -> Result<()
     Ok(())
 }
 
+#[tauri::command]
+#[specta::specta]
+pub fn change_show_next_meeting_setting(app: AppHandle, enabled: bool) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+    settings.show_next_meeting = enabled;
+    settings::write_settings(&app, settings);
+
+    // Apply immediately rather than letting the 30s poll catch up — a toggle
+    // that appears to do nothing for half a minute reads as broken.
+    #[cfg(target_os = "macos")]
+    tray::refresh_next_meeting(&app);
+
+    Ok(())
+}
+
 /// Save accelerator settings, re-apply globals, and unload the model so it
 /// reloads with the new backend on next transcription.
 fn apply_and_reload_accelerator(app: &AppHandle, s: settings::AppSettings) {

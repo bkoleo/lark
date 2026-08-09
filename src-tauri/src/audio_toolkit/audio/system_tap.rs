@@ -108,9 +108,7 @@ impl SystemAudioTap {
             }
 
             let samples: Option<Vec<f32>> = match ctx.common_format {
-                av::audio::CommonFormat::PcmF32 => {
-                    read_samples::<f32>(buffer).map(|s| s.to_vec())
-                }
+                av::audio::CommonFormat::PcmF32 => read_samples::<f32>(buffer).map(|s| s.to_vec()),
                 av::audio::CommonFormat::PcmF64 => {
                     read_samples::<f64>(buffer).map(|s| s.iter().map(|&v| v as f32).collect())
                 }

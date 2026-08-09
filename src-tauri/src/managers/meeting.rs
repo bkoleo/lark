@@ -285,8 +285,7 @@ impl MeetingManager {
         // mic timestamps line up with the system track.
         let wall_secs = mic_started.elapsed().as_secs_f64();
         let expected = (wall_secs * SAMPLE_RATE as f64) as usize;
-        let drift =
-            (mic_samples.len() as f64 - expected as f64).abs() / expected.max(1) as f64;
+        let drift = (mic_samples.len() as f64 - expected as f64).abs() / expected.max(1) as f64;
         if drift > 0.05 {
             log::warn!(
                 "Meeting mic track drifted {:.0}% off wall-clock ({:.1}s vs {:.1}s) — normalising",
@@ -513,7 +512,10 @@ impl MeetingManager {
             Some(title) => md.push_str(&format!("title: {}\n", yaml_scalar(title))),
             None => md.push_str("title: null\n"),
         }
-        let attendees = calendar.as_ref().map(|c| c.attendees.clone()).unwrap_or_default();
+        let attendees = calendar
+            .as_ref()
+            .map(|c| c.attendees.clone())
+            .unwrap_or_default();
         if attendees.is_empty() {
             md.push_str("attendees: []\n");
         } else {
@@ -524,10 +526,7 @@ impl MeetingManager {
         }
         // Lets a consumer tell "the calendar said nobody was there" apart from
         // "we never asked the calendar", which change the meaning of `[]`.
-        md.push_str(&format!(
-            "calendar_matched: {}\n",
-            calendar.is_some()
-        ));
+        md.push_str(&format!("calendar_matched: {}\n", calendar.is_some()));
         md.push_str("source: lark\n");
         md.push_str("---\n\n");
 
@@ -668,8 +667,8 @@ Transcript:\n{}",
     /// clamshell (lid closed) override.
     fn selected_mic_device(&self) -> Option<cpal::Device> {
         let settings = get_settings(&self.app_handle);
-        let use_clamshell = clamshell::is_clamshell().unwrap_or(false)
-            && settings.clamshell_microphone.is_some();
+        let use_clamshell =
+            clamshell::is_clamshell().unwrap_or(false) && settings.clamshell_microphone.is_some();
         let device_name = if use_clamshell {
             settings.clamshell_microphone.clone()
         } else {
@@ -691,12 +690,7 @@ fn fit_to_length(samples: &mut Vec<f32>, expected: usize) {
 /// One JSON object per line, flushed immediately. Deliberately dependency-free
 /// and append-only: the whole point is that a SIGKILL between two segments
 /// leaves everything before it intact and parseable.
-fn append_partial(
-    file: Option<&mut std::fs::File>,
-    start: usize,
-    speaker: &str,
-    text: &str,
-) {
+fn append_partial(file: Option<&mut std::fs::File>, start: usize, speaker: &str, text: &str) {
     use std::io::Write;
     let Some(file) = file else { return };
     let line = serde_json::json!({
@@ -726,14 +720,21 @@ fn sanitise_for_filename(title: &str) -> String {
     let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     // Leading dots hide the file; trailing ones confuse extension parsing.
     let trimmed = collapsed.trim_matches('.').trim();
-    trimmed.chars().take(60).collect::<String>().trim().to_string()
+    trimmed
+        .chars()
+        .take(60)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 /// Quote a YAML scalar only when it needs it, so the common case stays
 /// readable. Single quotes with doubling is the safest minimal form.
 fn yaml_scalar(value: &str) -> String {
     let needs_quoting = value.is_empty()
-        || value.starts_with(['-', '?', ':', '&', '*', '!', '|', '>', '\'', '"', '%', '@', '`', '[', '{', '#'])
+        || value.starts_with([
+            '-', '?', ':', '&', '*', '!', '|', '>', '\'', '"', '%', '@', '`', '[', '{', '#',
+        ])
         || value.contains(": ")
         || value.contains(" #")
         || value.ends_with(':')
@@ -820,10 +821,16 @@ No AI notes, and the mic-bleed dedup pass did not run.\n\n## Transcript\n\n",
         }
         match std::fs::write(&md_path, md) {
             Ok(()) => {
-                log::info!("Recovered orphaned meeting transcript: {}", md_path.display());
+                log::info!(
+                    "Recovered orphaned meeting transcript: {}",
+                    md_path.display()
+                );
                 let _ = std::fs::remove_file(&path);
             }
-            Err(e) => log::warn!("Failed to write recovered meeting {}: {e}", md_path.display()),
+            Err(e) => log::warn!(
+                "Failed to write recovered meeting {}: {e}",
+                md_path.display()
+            ),
         }
     }
 }
@@ -916,7 +923,11 @@ mod tests {
     fn drops_mic_copy_of_system_line_nearby() {
         let out = drop_mic_bleed(vec![
             entry(20, "Kole", "I think we should move the launch date to July"),
-            entry(20, "Them", "I think we should move the launch date to July."),
+            entry(
+                20,
+                "Them",
+                "I think we should move the launch date to July.",
+            ),
         ]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].1, "Them");
@@ -925,8 +936,16 @@ mod tests {
     #[test]
     fn drops_mic_copy_with_minor_transcription_differences() {
         let out = drop_mic_bleed(vec![
-            entry(28, "Kole", "The website copy needs a final review before we ship"),
-            entry(30, "Them", "The Win Side copy needs a final review before we shift."),
+            entry(
+                28,
+                "Kole",
+                "The website copy needs a final review before we ship",
+            ),
+            entry(
+                30,
+                "Them",
+                "The Win Side copy needs a final review before we shift.",
+            ),
         ]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].1, "Them");

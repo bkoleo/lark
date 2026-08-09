@@ -299,6 +299,10 @@ fn initialize_core_logic(app_handle: &AppHandle) {
         tray::set_tray_visibility(app_handle, false);
     }
 
+    // Show the day's next meeting beside the tray icon.
+    #[cfg(target_os = "macos")]
+    tray::start_next_meeting_updates(app_handle.clone());
+
     // Refresh tray menu when model state changes
     let app_handle_for_listener = app_handle.clone();
     app_handle.listen("model-state-changed", move |_| {
@@ -399,6 +403,7 @@ pub fn run(cli_args: CliArgs) {
             shortcut::change_keyboard_implementation_setting,
             shortcut::get_keyboard_implementation,
             shortcut::change_show_tray_icon_setting,
+            shortcut::change_show_next_meeting_setting,
             shortcut::change_whisper_accelerator_setting,
             shortcut::change_ort_accelerator_setting,
             shortcut::change_whisper_gpu_device,

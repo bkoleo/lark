@@ -179,7 +179,13 @@ impl AudioRecorder {
                     let _ = init_tx.send(Ok(()));
                     // Keep the stream alive while we process samples.
                     run_consumer(
-                        sample_rate, vad, sample_rx, cmd_rx, level_cb, flow_cb, stop_flag,
+                        sample_rate,
+                        vad,
+                        sample_rx,
+                        cmd_rx,
+                        level_cb,
+                        flow_cb,
+                        stop_flag,
                     );
                     drop(stream);
                 }

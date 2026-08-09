@@ -9,7 +9,8 @@
     "cancel": "Cancel",
     "meetingStart": "Start Meeting Recording",
     "meetingStop": "Stop Meeting & Transcribe",
-    "meetingProcessing": "Transcribing Meeting…"
+    "meetingProcessing": "Transcribing Meeting…",
+    "meetingsDone": "Meetings done"
   },
   "sidebar": {
     "general": "General",
@@ -286,6 +287,10 @@
       "showTrayIcon": {
         "label": "Show Tray Icon",
         "description": "Display the Lark icon in the system tray."
+      },
+      "showNextMeeting": {
+        "label": "Show Next Meeting",
+        "description": "Show the next event from your calendar in the menu bar, next to the Lark icon. Counts down within the hour, then shows the start time. Stays empty once the day is clear."
       },
       "overlay": {
         "title": "Overlay Position",

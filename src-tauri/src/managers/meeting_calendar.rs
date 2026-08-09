@@ -133,6 +133,146 @@ mod imp {
     /// to grab the next meeting on a back-to-back day.
     const GRACE: Duration = Duration::from_secs(10 * 60);
 
+    /// What the menu bar needs to know about the meeting coming up.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct UpcomingEvent {
+        pub title: String,
+        /// Seconds until it starts; zero or negative once it is under way.
+        pub starts_in_secs: i64,
+        /// Local start time, 24-hour, e.g. `14:30`.
+        pub start_hm: String,
+    }
+
+    /// The state of the day ahead.
+    ///
+    /// `Clear` and `Unavailable` are deliberately distinct. Both would render as
+    /// an empty menu bar, but only one of them can honestly claim the day is
+    /// done — telling someone their meetings are over because we were never
+    /// allowed to look is the one failure here that could actually cost them
+    /// something.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum NextMeeting {
+        /// Calendar readable, and something is still to come.
+        Upcoming(UpcomingEvent),
+        /// Calendar readable, nothing left today.
+        Clear,
+        /// No calendar access, so the day is genuinely unknown.
+        Unavailable,
+    }
+
+    /// The next event still to come today — in progress or upcoming, whichever
+    /// starts soonest.
+    ///
+    /// **Never prompts.** Unlike [`current_event`], this runs on a timer in the
+    /// background rather than at a moment the user chose, so it only reads an
+    /// access decision that has already been made. Asking here would pop the
+    /// permission dialog unbidden, thirty seconds after launch, over whatever
+    /// the user was actually doing.
+    pub fn next_meeting() -> NextMeeting {
+        unsafe {
+            if !has_access() {
+                return NextMeeting::Unavailable;
+            }
+
+            let store = EKEventStore::new();
+
+            // Only today. "Nothing left today" is a meaningful, restful state;
+            // showing tomorrow's 9am standup all evening is not.
+            let start = NSDate::dateWithTimeIntervalSinceNow(-(GRACE.as_secs() as f64));
+            let end = NSDate::dateWithTimeIntervalSinceNow(secs_until_local_midnight());
+
+            let predicate =
+                store.predicateForEventsWithStartDate_endDate_calendars(&start, &end, None);
+            let events: objc2::rc::Retained<NSArray<objc2_event_kit::EKEvent>> =
+                store.eventsMatchingPredicate(&predicate);
+
+            let now_epoch = NSDate::now().timeIntervalSince1970();
+
+            let mut best: Option<(f64, UpcomingEvent)> = None;
+            for event in events.iter() {
+                // An all-day banner is not a meeting, and a declined invite is
+                // one the user has already said they are not attending.
+                if event.isAllDay() || is_declined(&event) {
+                    continue;
+                }
+
+                let title = {
+                    let t: objc2::rc::Retained<NSString> = event.title();
+                    let t = t.to_string();
+                    if t.trim().is_empty() {
+                        continue;
+                    }
+                    t.trim().to_string()
+                };
+
+                let start_epoch = event.startDate().timeIntervalSince1970();
+                let end_epoch = event.endDate().timeIntervalSince1970();
+
+                // Already finished — the grace window above can still catch one.
+                if end_epoch < now_epoch {
+                    continue;
+                }
+
+                if best.as_ref().map(|(s, _)| start_epoch < *s).unwrap_or(true) {
+                    let Some(start_hm) = local_hm(start_epoch) else {
+                        continue;
+                    };
+                    best = Some((
+                        start_epoch,
+                        UpcomingEvent {
+                            title,
+                            starts_in_secs: (start_epoch - now_epoch).round() as i64,
+                            start_hm,
+                        },
+                    ));
+                }
+            }
+
+            match best {
+                Some((_, ev)) => NextMeeting::Upcoming(ev),
+                None => NextMeeting::Clear,
+            }
+        }
+    }
+
+    /// True only when access is already granted. Reads the decision, never asks.
+    unsafe fn has_access() -> bool {
+        matches!(
+            EKEventStore::authorizationStatusForEntityType(EKEntityType::Event),
+            EKAuthorizationStatus::FullAccess
+        )
+    }
+
+    /// Whether the user has declined this invite. EventKit reports the status of
+    /// every participant, so we look for the one flagged as us.
+    unsafe fn is_declined(event: &objc2_event_kit::EKEvent) -> bool {
+        let Some(participants) = event.attendees() else {
+            return false;
+        };
+        participants.iter().any(|p| {
+            p.isCurrentUser()
+                && p.participantStatus() == objc2_event_kit::EKParticipantStatus::Declined
+        })
+    }
+
+    /// Seconds from now to the next local midnight.
+    ///
+    /// Derived from the wall clock rather than by constructing tomorrow's date,
+    /// so a DST boundary shifts the answer by an hour instead of panicking on a
+    /// local time that does not exist.
+    fn secs_until_local_midnight() -> f64 {
+        use chrono::Timelike;
+        let now = chrono::Local::now();
+        let elapsed = now.num_seconds_from_midnight() as f64;
+        (86_400.0 - elapsed).max(60.0)
+    }
+
+    /// A Unix timestamp as local `HH:MM`.
+    fn local_hm(epoch: f64) -> Option<String> {
+        let dt = chrono::DateTime::from_timestamp(epoch as i64, 0)?;
+        Some(dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
+    }
+
     /// Returns true once the app holds calendar read access.
     ///
     /// The request is asynchronous; we wait briefly for the user's answer the
@@ -160,10 +300,7 @@ mod imp {
             _ => {}
         }
 
-        log::info!(
-            "Requesting calendar access (current status {})",
-            status.0
-        );
+        log::info!("Requesting calendar access (current status {})", status.0);
 
         use std::sync::{Arc, Mutex};
         // The completion block hands back *why*, not just *whether*. A silent
@@ -175,20 +312,22 @@ mod imp {
         // is the only place that distinguishes it from a real user denial.
         let outcome = Arc::new(Mutex::new(None::<(bool, Option<String>)>));
         let sink = outcome.clone();
-        let handler = block2::RcBlock::new(move |ok: objc2::runtime::Bool, err: *mut objc2_foundation::NSError| {
-            let detail = if err.is_null() {
-                None
-            } else {
-                let err = &*err;
-                Some(format!(
-                    "{} {}: {}",
-                    err.domain(),
-                    err.code(),
-                    err.localizedDescription()
-                ))
-            };
-            *sink.lock().unwrap() = Some((ok.as_bool(), detail));
-        });
+        let handler = block2::RcBlock::new(
+            move |ok: objc2::runtime::Bool, err: *mut objc2_foundation::NSError| {
+                let detail = if err.is_null() {
+                    None
+                } else {
+                    let err = &*err;
+                    Some(format!(
+                        "{} {}: {}",
+                        err.domain(),
+                        err.code(),
+                        err.localizedDescription()
+                    ))
+                };
+                *sink.lock().unwrap() = Some((ok.as_bool(), detail));
+            },
+        );
         store.requestFullAccessToEventsWithCompletion(block2::RcBlock::as_ptr(&handler));
         // Deliberately leaked. If the user leaves the permission dialog sitting
         // for longer than the poll below waits, dropping the block would free it
@@ -234,6 +373,24 @@ mod imp {
     pub fn current_event() -> Option<CalendarContext> {
         None
     }
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct UpcomingEvent {
+        pub title: String,
+        pub starts_in_secs: i64,
+        pub start_hm: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum NextMeeting {
+        Upcoming(UpcomingEvent),
+        Clear,
+        Unavailable,
+    }
+
+    pub fn next_meeting() -> NextMeeting {
+        NextMeeting::Unavailable
+    }
 }
 
-pub use imp::{current_event, CalendarContext};
+pub use imp::{current_event, next_meeting, CalendarContext, NextMeeting, UpcomingEvent};

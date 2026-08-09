@@ -435,6 +435,12 @@ pub struct AppSettings {
     pub keyboard_implementation: KeyboardImplementation,
     #[serde(default = "default_show_tray_icon")]
     pub show_tray_icon: bool,
+    /// Show the next calendar event of the day beside the menu bar icon.
+    /// Reads the same EventKit grant meeting recordings already use, so turning
+    /// it on never asks for anything new — and with access denied it simply
+    /// shows nothing rather than nagging.
+    #[serde(default = "default_show_next_meeting")]
+    pub show_next_meeting: bool,
     #[serde(default = "default_paste_delay_ms")]
     pub paste_delay_ms: u64,
     #[serde(default = "default_typing_tool")]
@@ -536,6 +542,10 @@ fn default_app_language() -> String {
 }
 
 fn default_show_tray_icon() -> bool {
+    true
+}
+
+fn default_show_next_meeting() -> bool {
     true
 }
 
@@ -856,6 +866,7 @@ pub fn get_default_settings() -> AppSettings {
         lazy_stream_close: false,
         keyboard_implementation: KeyboardImplementation::default(),
         show_tray_icon: default_show_tray_icon(),
+        show_next_meeting: default_show_next_meeting(),
         paste_delay_ms: default_paste_delay_ms(),
         typing_tool: default_typing_tool(),
         external_script_path: None,
