@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="src-tauri/icons/128x128.png" width="96" alt="Lark">
+</p>
+
 # Lark
 
 **A macOS dictation app that also records and transcribes your meetings, entirely on your own machine.**
