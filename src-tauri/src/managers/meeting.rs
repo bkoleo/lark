@@ -24,7 +24,9 @@ use tauri::{AppHandle, Manager};
 use tauri_plugin_opener::OpenerExt;
 
 use crate::audio_toolkit::audio::SystemAudioTap;
-use crate::audio_toolkit::audio::{list_input_devices, save_wav_file, AudioRecorder};
+use crate::audio_toolkit::audio::{
+    list_input_devices, read_wav_samples, save_wav_file, AudioRecorder,
+};
 use crate::helpers::clamshell;
 use crate::managers::meeting_calendar::{self, CalendarContext};
 use crate::managers::transcription::TranscriptionManager;
@@ -327,6 +329,88 @@ impl MeetingManager {
                 Err(e) => log::error!("Meeting transcription failed: {e}"),
             }
         });
+    }
+
+    /// Re-transcribes a meeting from the `(mic).wav` / `(system).wav` tracks it
+    /// left next to the transcript, overwriting the `.md` in place.
+    ///
+    /// The transcript is the only lossy step in meeting mode — the tracks are
+    /// raw audio, so a transcript spoiled by a bad model, a bad setting or a
+    /// bad custom-word list is recoverable for as long as the WAVs survive
+    /// their 24h retention. Without this the only route back was re-recording
+    /// a call that already happened.
+    ///
+    /// `path` may point at either track or at the transcript itself. The
+    /// calendar is deliberately not consulted: it can only answer "what is on
+    /// now", and re-reading it hours later would staple an unrelated meeting's
+    /// title onto this one.
+    pub fn retranscribe_from_wavs(self: &Arc<Self>, path: &std::path::Path) -> Result<()> {
+        if !matches!(self.status(), MeetingStatus::Idle) {
+            return Err(anyhow!("a meeting is already recording or processing"));
+        }
+
+        let dir = path
+            .parent()
+            .ok_or_else(|| anyhow!("no parent directory for {}", path.display()))?
+            .to_path_buf();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| anyhow!("unreadable path {}", path.display()))?;
+        let stem = name
+            .trim_end_matches(".md")
+            .trim_end_matches(".wav")
+            .trim_end_matches(" (mic)")
+            .trim_end_matches(" (system)")
+            .to_string();
+
+        // Recover the original start time from the "YYYY-MM-DD HHMM …" stem so
+        // the rebuilt transcript keeps the timestamps it was recorded with.
+        let started = chrono::NaiveDateTime::parse_from_str(
+            stem.get(..15).unwrap_or_default(),
+            "%Y-%m-%d %H%M",
+        )
+        .map_err(|e| anyhow!("cannot read a start time from {stem:?}: {e}"))?
+        .and_local_timezone(Local)
+        .single()
+        .ok_or_else(|| anyhow!("ambiguous local start time in {stem:?}"))?;
+
+        let mic_path = dir.join(format!("{stem} (mic).wav"));
+        let sys_path = dir.join(format!("{stem} (system).wav"));
+        let mic_samples = read_wav_samples(&mic_path).unwrap_or_else(|e| {
+            log::warn!("No mic track for {stem:?} ({e})");
+            Vec::new()
+        });
+        let sys_samples = read_wav_samples(&sys_path).unwrap_or_else(|e| {
+            log::warn!("No system track for {stem:?} ({e})");
+            Vec::new()
+        });
+        if mic_samples.is_empty() && sys_samples.is_empty() {
+            return Err(anyhow!("no audio tracks found for {stem:?}"));
+        }
+
+        log::info!(
+            "Re-transcribing {stem:?}: mic {:.1}s, system {:.1}s",
+            mic_samples.len() as f32 / SAMPLE_RATE as f32,
+            sys_samples.len() as f32 / SAMPLE_RATE as f32,
+        );
+
+        *self.state.lock().unwrap() = MeetingState::Processing;
+        let manager = self.clone();
+        std::thread::spawn(move || {
+            let result = manager.process(mic_samples, sys_samples, started, None);
+            *manager.state.lock().unwrap() = MeetingState::Idle;
+            crate::tray::update_tray_menu(
+                &manager.app_handle,
+                &crate::tray::TrayIconState::Idle,
+                None,
+            );
+            match result {
+                Ok(path) => log::info!("Meeting re-transcribed to {}", path.display()),
+                Err(e) => log::error!("Meeting re-transcription failed: {e}"),
+            }
+        });
+        Ok(())
     }
 
     fn process(

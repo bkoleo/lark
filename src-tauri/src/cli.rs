@@ -27,6 +27,12 @@ pub struct CliArgs {
     #[arg(long)]
     pub toggle_meeting: bool,
 
+    /// Re-transcribe a saved meeting from its WAV tracks, overwriting the
+    /// transcript. Takes either track or the .md (sent to running instance,
+    /// macOS only)
+    #[arg(long, value_name = "PATH")]
+    pub retranscribe_meeting: Option<String>,
+
     /// Enable debug mode with verbose logging
     #[arg(long)]
     pub debug: bool,

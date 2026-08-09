@@ -534,6 +534,28 @@ pub fn run(cli_args: CliArgs) {
                         tray::update_tray_menu(&app_clone, &tray::TrayIconState::Idle, None);
                     });
                 }
+            } else if let Some(target) = args
+                .iter()
+                .position(|a| a == "--retranscribe-meeting")
+                .and_then(|i| args.get(i + 1))
+                .cloned()
+            {
+                #[cfg(target_os = "macos")]
+                {
+                    let meeting_manager = app
+                        .state::<Arc<managers::meeting::MeetingManager>>()
+                        .inner()
+                        .clone();
+                    std::thread::spawn(move || {
+                        if let Err(e) =
+                            meeting_manager.retranscribe_from_wavs(std::path::Path::new(&target))
+                        {
+                            log::error!("Re-transcribe failed: {e}");
+                        }
+                    });
+                }
+                #[cfg(not(target_os = "macos"))]
+                let _ = target;
             } else {
                 show_main_window(app);
             }
