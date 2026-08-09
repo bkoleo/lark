@@ -71,7 +71,17 @@ fn generate_tray_translations() {
     for (lang, tray) in &translations {
         out.push_str(&format!("    m.insert(\"{lang}\", TrayStrings {{\n"));
         for (rust_field, json_key) in &fields {
-            let val = tray.get(json_key).and_then(|v| v.as_str()).unwrap_or("");
+            // Fall back to English, never to "". A locale that has not caught up
+            // with a new key used to emit an empty string, which renders as a
+            // blank, unreadable tray menu item rather than an untranslated one —
+            // and did, for all three meeting entries in all 19 non-English
+            // locales. An English word beats an invisible one.
+            let val = tray
+                .get(json_key)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| english.get(json_key).and_then(|v| v.as_str()))
+                .unwrap_or("");
             out.push_str(&format!(
                 "        {rust_field}: \"{}\".to_string(),\n",
                 escape_string(val)
