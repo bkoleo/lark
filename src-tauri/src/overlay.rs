@@ -16,7 +16,7 @@ use tauri::WebviewWindowBuilder;
 use tauri::WebviewUrl;
 
 #[cfg(target_os = "macos")]
-use tauri_nspanel::{tauri_panel, CollectionBehavior, PanelBuilder, PanelLevel};
+use tauri_nspanel::{tauri_panel, CollectionBehavior, PanelBuilder, PanelLevel, StyleMask};
 
 #[cfg(target_os = "linux")]
 use gtk_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
@@ -368,13 +368,22 @@ pub fn create_recording_overlay(app_handle: &AppHandle) {
             .has_shadow(false)
             .transparent(true)
             .no_activate(true)
+            // no_activate only suppresses activation while the panel is being
+            // created; NonactivatingPanel is what keeps a *click* on the pill
+            // (e.g. the Copy button) from activating the app — activating
+            // would drag the main settings window to the front with it.
+            // borderless() must come first: it resets the mask, not ORs it.
+            .style_mask(StyleMask::empty().borderless().nonactivating_panel())
             .corner_radius(0.0)
             .with_window(|w| {
                 // Pin to dark so the HUD glass stays dark even when the
                 // system is in light mode (HudWindow material follows the
                 // window's appearance, not the CSS).
+                // accept_first_mouse: the app is never active when the pill is
+                // clicked, so the first click must land, not just focus.
                 w.decorations(false)
                     .transparent(true)
+                    .accept_first_mouse(true)
                     .theme(Some(tauri::Theme::Dark))
             })
             .collection_behavior(
@@ -484,8 +493,11 @@ pub fn create_meeting_prompt_window(app_handle: &AppHandle) {
         .has_shadow(false)
         .transparent(true)
         .no_activate(true)
+        // Same as the recording pill: clicking the card's Record button must
+        // not activate the app (see create_recording_overlay).
+        .style_mask(StyleMask::empty().borderless().nonactivating_panel())
         .corner_radius(0.0)
-        .with_window(|w| w.decorations(false).transparent(true))
+        .with_window(|w| w.decorations(false).transparent(true).accept_first_mouse(true))
         .collection_behavior(
             CollectionBehavior::new()
                 .can_join_all_spaces()
