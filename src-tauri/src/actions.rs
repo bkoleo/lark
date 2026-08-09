@@ -70,8 +70,7 @@ fn spawn_mic_flow_watchdog(app: &AppHandle, rm: &Arc<AudioRecordingManager>, bin
         // Returns Some(true) if audio flowed, Some(false) on timeout,
         // None if the recording ended while waiting.
         let wait_for_flow = |rm: &Arc<AudioRecordingManager>| {
-            let deadline =
-                Instant::now() + std::time::Duration::from_millis(AUDIO_FLOW_TIMEOUT_MS);
+            let deadline = Instant::now() + std::time::Duration::from_millis(AUDIO_FLOW_TIMEOUT_MS);
             while Instant::now() < deadline {
                 if !rm.is_recording() {
                     return None;
@@ -114,7 +113,10 @@ fn spawn_mic_flow_watchdog(app: &AppHandle, rm: &Arc<AudioRecordingManager>, bin
         }
 
         let device = rm.current_device_name();
-        warn!("Microphone {:?} still silent after restart — alerting user", device);
+        warn!(
+            "Microphone {:?} still silent after restart — alerting user",
+            device
+        );
         let _ = app.emit(
             "mic-status",
             MicStatusEvent {
@@ -593,6 +595,12 @@ impl ShortcutAction for TranscribeAction {
         change_tray_icon(app, TrayIconState::Transcribing);
         show_transcribing_overlay(app);
 
+        // Remember where this dictation is meant to land, before the user has
+        // any chance to wander off. Queued on the main thread (NSWorkspace is
+        // main-thread only); the paste closure is queued later, so the event
+        // loop runs them in that order.
+        let _ = app.run_on_main_thread(crate::paste_guard::remember_target);
+
         // Unmute before playing audio feedback so the stop sound is audible
         rm.remove_mute();
 
@@ -742,17 +750,47 @@ impl ShortcutAction for TranscribeAction {
                                 let paste_time = Instant::now();
                                 let final_text = processed.final_text;
                                 ah.run_on_main_thread(move || {
-                                    match utils::paste(final_text, ah_clone.clone()) {
-                                        Ok(()) => debug!(
-                                            "Text pasted successfully in {:?}",
-                                            paste_time.elapsed()
-                                        ),
+                                    // Switched apps while it was transcribing?
+                                    // Pasting now would fire the text into
+                                    // whatever is under the cursor. Hold it and
+                                    // offer a Copy button on the pill instead.
+                                    if crate::paste_guard::target_changed() {
+                                        if crate::overlay::show_copy_ready_overlay(&ah_clone) {
+                                            info!(
+                                                "Foreground app changed during transcription — \
+                                                 holding {} chars for Copy instead of pasting",
+                                                final_text.len()
+                                            );
+                                            crate::paste_guard::set_pending(final_text);
+                                            change_tray_icon(&ah_clone, TrayIconState::Idle);
+                                            return;
+                                        }
+                                        // No overlay to offer it on (position =
+                                        // None): fall through and paste rather
+                                        // than swallow the dictation.
+                                    }
+
+                                    match utils::paste(final_text.clone(), ah_clone.clone()) {
+                                        Ok(()) => {
+                                            debug!(
+                                                "Text pasted successfully in {:?}",
+                                                paste_time.elapsed()
+                                            );
+                                            utils::hide_recording_overlay(&ah_clone);
+                                        }
                                         Err(e) => {
                                             error!("Failed to paste transcription: {}", e);
                                             let _ = ah_clone.emit("paste-error", ());
+                                            // The text never made it anywhere —
+                                            // offer it as a Copy rather than
+                                            // dropping it on the floor.
+                                            if crate::overlay::show_copy_ready_overlay(&ah_clone) {
+                                                crate::paste_guard::set_pending(final_text);
+                                            } else {
+                                                utils::hide_recording_overlay(&ah_clone);
+                                            }
                                         }
                                     }
-                                    utils::hide_recording_overlay(&ah_clone);
                                     change_tray_icon(&ah_clone, TrayIconState::Idle);
                                 })
                                 .unwrap_or_else(|e| {

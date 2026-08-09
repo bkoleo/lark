@@ -12,6 +12,7 @@ mod llm_client;
 mod maintenance;
 mod managers;
 mod overlay;
+mod paste_guard;
 pub mod portable;
 mod settings;
 mod shortcut;
@@ -408,6 +409,7 @@ pub fn run(cli_args: CliArgs) {
             show_main_window_command,
             commands::cancel_operation,
             commands::meeting_prompt_action,
+            commands::copy_ready_action,
             commands::meetings::list_meeting_notes,
             commands::meetings::open_meeting_note,
             commands::meetings::open_meetings_folder,

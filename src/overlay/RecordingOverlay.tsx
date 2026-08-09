@@ -1,14 +1,26 @@
 import { listen, emit } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow, LogicalPosition } from "@tauri-apps/api/window";
 import React, { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { TranscriptionIcon, CancelIcon } from "../components/icons";
+import {
+  TranscriptionIcon,
+  CancelIcon,
+  CopyIcon,
+  CheckIcon,
+} from "../components/icons";
 import "./RecordingOverlay.css";
 import { commands } from "@/bindings";
 import i18n, { syncLanguageFromSettings } from "@/i18n";
 import { getLanguageDirection } from "@/lib/utils/rtl";
 
-type OverlayState = "recording" | "transcribing" | "processing";
+type OverlayState = "recording" | "transcribing" | "processing" | "copyReady";
+
+/// How long the Copy pill waits before giving up and hiding itself. The text
+/// is never lost — the tray's Copy Last Transcript still has it.
+const COPY_READY_TIMEOUT_MS = 60_000;
+/// Time the "Copied" confirmation stays on screen before the pill hides.
+const COPIED_CONFIRM_MS = 900;
 type MicStatus = "connecting" | "live" | "silent";
 
 interface MicStatusPayload {
@@ -73,7 +85,37 @@ const RecordingOverlay: React.FC = () => {
   >(null);
   const [longMsgIdx, setLongMsgIdx] = useState(0);
   const [, setClockTick] = useState(0);
+  const [copied, setCopied] = useState(false);
+  const copyTimersRef = useRef<number[]>([]);
   const direction = getLanguageDirection(i18n.language);
+
+  const clearCopyTimers = () => {
+    copyTimersRef.current.forEach((id) => window.clearTimeout(id));
+    copyTimersRef.current = [];
+  };
+
+  // Raw invoke, not bindings.ts — that file only regenerates in debug builds,
+  // so a typed binding for a new command never reaches a release build.
+  const copyReadyAction = (action: "copy" | "dismiss") =>
+    invoke("copy_ready_action", { action }).catch((e) =>
+      console.error("copy_ready_action failed", e),
+    );
+
+  const handleCopyClick = async () => {
+    if (copied) return;
+    clearCopyTimers();
+    await copyReadyAction("copy");
+    setCopied(true);
+    copyTimersRef.current.push(
+      window.setTimeout(() => copyReadyAction("dismiss"), COPIED_CONFIRM_MS),
+    );
+  };
+
+  const handleCopyDismiss = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    clearCopyTimers();
+    void copyReadyAction("dismiss");
+  };
 
   // Drive the ring + countdown while a timed transcription is running.
   useEffect(() => {
@@ -126,6 +168,9 @@ const RecordingOverlay: React.FC = () => {
         // Sync language from settings each time overlay is shown
         await syncLanguageFromSettings();
         const overlayState = event.payload as OverlayState;
+        // A new dictation supersedes any Copy pill still on screen.
+        clearCopyTimers();
+        setCopied(false);
         setState(overlayState);
         if (overlayState === "recording") {
           setMicStatus("connecting");
@@ -138,6 +183,23 @@ const RecordingOverlay: React.FC = () => {
       // Listen for hide-overlay event from Rust
       const unlistenHide = await listen("hide-overlay", () => {
         setIsVisible(false);
+      });
+
+      // A paste was withheld because the foreground app changed mid-
+      // transcription: turn the pill into a Copy button.
+      const unlistenCopyReady = await listen("copy-ready", async () => {
+        await syncLanguageFromSettings();
+        clearCopyTimers();
+        setCopied(false);
+        setTranscribeInfo(null);
+        setState("copyReady");
+        setIsVisible(true);
+        copyTimersRef.current.push(
+          window.setTimeout(
+            () => copyReadyAction("dismiss"),
+            COPY_READY_TIMEOUT_MS,
+          ),
+        );
       });
 
       // Fired when the audio being transcribed is long enough to show a
@@ -176,6 +238,7 @@ const RecordingOverlay: React.FC = () => {
       return () => {
         unlistenShow();
         unlistenHide();
+        unlistenCopyReady();
         unlistenTranscribingInfo();
         unlistenMicStatus();
         unlistenLevel();
@@ -248,66 +311,93 @@ const RecordingOverlay: React.FC = () => {
       onPointerCancel={endDrag}
       className={`recording-overlay ${isVisible ? "fade-in" : ""} ${
         state === "recording" ? `mic-${micStatus}` : ""
-      }`}
+      } ${state === "copyReady" ? "copy-ready" : ""}`}
     >
-      <div className="overlay-main">
-        {state === "transcribing" && transcribeInfo && (
+      {state === "copyReady" ? (
+        <div
+          className="overlay-main copy-row"
+          role="button"
+          onClick={handleCopyClick}
+        >
           <div className="overlay-left">
-            <ProgressRing progress={ringProgress()} />
+            {copied ? (
+              <CheckIcon width={14} height={14} />
+            ) : (
+              <CopyIcon width={14} height={14} />
+            )}
           </div>
-        )}
-        {state !== "recording" && !(state === "transcribing" && transcribeInfo) && (
-          <div className="overlay-left">
-            <TranscriptionIcon />
+          <div className="overlay-middle">
+            <div className="copy-label">
+              {copied ? t("overlay.copied") : t("overlay.copy")}
+            </div>
           </div>
-        )}
-
-        <div className="overlay-middle">
-          {state === "recording" && (
-            <div className="bars-container">
-              {levels.map((v, i) => (
-                <div
-                  key={i}
-                  className="bar"
-                  style={{
-                    // Tuned to match the more sensitive Rust mapping so quiet
-                    // speech clearly fills the bars; silence stays a flat ~2px.
-                    height: `${Math.min(20, 2 + Math.pow(v, 0.6) * 18)}px`,
-                    transition:
-                      "height 60ms ease-out, opacity 120ms ease-out",
-                    opacity: Math.max(0.25, v * 1.9), // Minimum opacity for visibility
-                  }}
-                />
-              ))}
-            </div>
-          )}
-          {state === "transcribing" && (
-            <div
-              className={`transcribing-text ${
-                transcribeInfo && transcribeInfo.audioSecs >= 60 ? "long" : ""
-              }`}
-            >
-              {transcribingText()}
-            </div>
-          )}
-          {state === "processing" && (
-            <div className="transcribing-text">{t("overlay.processing")}</div>
-          )}
-        </div>
-
-        <div className="overlay-right">
-          {state === "recording" && (
-            <div
-              className="cancel-button"
-              onClick={() => {
-                commands.cancelOperation();
-              }}
-            >
+          <div className="overlay-right">
+            <div className="cancel-button" onClick={handleCopyDismiss}>
               <CancelIcon />
             </div>
-          )}
+          </div>
         </div>
-      </div>
+      ) : (
+        <div className="overlay-main">
+          {state === "transcribing" && transcribeInfo && (
+            <div className="overlay-left">
+              <ProgressRing progress={ringProgress()} />
+            </div>
+          )}
+          {state !== "recording" &&
+            !(state === "transcribing" && transcribeInfo) && (
+              <div className="overlay-left">
+                <TranscriptionIcon />
+              </div>
+            )}
+
+          <div className="overlay-middle">
+            {state === "recording" && (
+              <div className="bars-container">
+                {levels.map((v, i) => (
+                  <div
+                    key={i}
+                    className="bar"
+                    style={{
+                      // Tuned to match the more sensitive Rust mapping so quiet
+                      // speech clearly fills the bars; silence stays a flat ~2px.
+                      height: `${Math.min(20, 2 + Math.pow(v, 0.6) * 18)}px`,
+                      transition:
+                        "height 60ms ease-out, opacity 120ms ease-out",
+                      opacity: Math.max(0.25, v * 1.9), // Minimum opacity for visibility
+                    }}
+                  />
+                ))}
+              </div>
+            )}
+            {state === "transcribing" && (
+              <div
+                className={`transcribing-text ${
+                  transcribeInfo && transcribeInfo.audioSecs >= 60 ? "long" : ""
+                }`}
+              >
+                {transcribingText()}
+              </div>
+            )}
+            {state === "processing" && (
+              <div className="transcribing-text">{t("overlay.processing")}</div>
+            )}
+          </div>
+
+          <div className="overlay-right">
+            {state === "recording" && (
+              <div
+                className="cancel-button"
+                onClick={() => {
+                  commands.cancelOperation();
+                }}
+              >
+                <CancelIcon />
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {state === "recording" && (
         <div

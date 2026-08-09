@@ -552,6 +552,32 @@ pub fn show_transcribing_overlay(app_handle: &AppHandle) {
     show_overlay_state(app_handle, "transcribing");
 }
 
+/// Turns the pill into a Copy button after a paste was withheld because the
+/// user switched apps mid-transcription (see paste_guard).
+///
+/// Returns false when there is no overlay to show it on — the caller must then
+/// paste as normal rather than silently swallowing the text.
+pub fn show_copy_ready_overlay(app_handle: &AppHandle) -> bool {
+    let settings = settings::get_settings(app_handle);
+    if settings.overlay_position == OverlayPosition::None {
+        return false;
+    }
+
+    update_overlay_position(app_handle);
+
+    let Some(overlay_window) = app_handle.get_webview_window("recording_overlay") else {
+        return false;
+    };
+    if overlay_window.show().is_err() {
+        return false;
+    }
+
+    #[cfg(target_os = "windows")]
+    force_overlay_topmost(&overlay_window);
+
+    overlay_window.emit("copy-ready", ()).is_ok()
+}
+
 /// Shows the processing overlay window
 pub fn show_processing_overlay(app_handle: &AppHandle) {
     show_overlay_state(app_handle, "processing");

@@ -66,6 +66,31 @@ pub fn meeting_prompt_action(app: AppHandle, action: String) -> Result<(), Strin
     }
 }
 
+/// Handles a click on the Copy pill shown when a paste was withheld because
+/// the user switched apps mid-transcription. "copy" puts the held text on the
+/// clipboard and leaves the pill up briefly so the confirmation is visible;
+/// "dismiss" hides it. Either way the text stays reachable from the tray's
+/// Copy Last Transcript and from History.
+#[tauri::command]
+#[specta::specta]
+pub fn copy_ready_action(app: AppHandle, action: String) -> Result<(), String> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+
+    if action == "copy" {
+        let text = crate::paste_guard::take_pending()
+            .ok_or_else(|| "No transcription is waiting to be copied".to_string())?;
+        app.clipboard()
+            .write_text(text)
+            .map_err(|e| format!("Failed to copy transcription: {e}"))?;
+        log::info!("Held transcription copied to clipboard from the overlay");
+        return Ok(());
+    }
+
+    crate::paste_guard::clear_pending();
+    crate::overlay::hide_recording_overlay(&app);
+    Ok(())
+}
+
 #[tauri::command]
 #[specta::specta]
 pub fn is_portable() -> bool {

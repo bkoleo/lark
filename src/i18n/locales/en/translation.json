@@ -618,6 +618,8 @@
   "overlay": {
     "transcribing": "Transcribing...",
     "processing": "Processing...",
+    "copy": "Copy",
+    "copied": "Copied",
     "connecting": "connecting to microphone…",
     "connectingTo": "connecting to {{device}}…",
     "noAudio": "NO AUDIO — microphone is silent",
