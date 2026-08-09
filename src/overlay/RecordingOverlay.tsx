@@ -264,6 +264,11 @@ const RecordingOverlay: React.FC = () => {
     // The clickable "NO AUDIO" status deep-links to settings — don't start a
     // drag from it.
     if ((e.target as HTMLElement).closest(".mic-status-clickable")) return;
+    // The Copy pill is one big button. Pointer capture retargets the eventual
+    // click to this wrapper (WebKit dispatches click at the capture target),
+    // so capturing here would make the copy handler unreachable — the same
+    // reason the two exemptions above exist. No dragging while it's a button.
+    if (state === "copyReady") return;
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     const win = getCurrentWindow();
     const [pos, scale] = await Promise.all([
