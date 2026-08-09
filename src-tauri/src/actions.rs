@@ -525,6 +525,12 @@ impl ShortcutAction for TranscribeAction {
         change_tray_icon(app, TrayIconState::Recording);
         show_recording_overlay(app);
 
+        // Remember where this dictation is meant to land. Captured at start,
+        // not stop: NSWorkspace is main-thread only, and a hop queued at stop
+        // can land after the user has already clicked away — recording the
+        // wrong app as the target and defeating the check entirely.
+        let _ = app.run_on_main_thread(crate::paste_guard::remember_target);
+
         // Get the microphone mode to determine audio feedback timing
         let settings = get_settings(app);
         let is_always_on = settings.always_on_microphone;
@@ -595,11 +601,9 @@ impl ShortcutAction for TranscribeAction {
         change_tray_icon(app, TrayIconState::Transcribing);
         show_transcribing_overlay(app);
 
-        // Remember where this dictation is meant to land, before the user has
-        // any chance to wander off. Queued on the main thread (NSWorkspace is
-        // main-thread only); the paste closure is queued later, so the event
-        // loop runs them in that order.
-        let _ = app.run_on_main_thread(crate::paste_guard::remember_target);
+        // Open the watch window: any click from here until the text is ready
+        // means the user moved on and the paste must not fire blind.
+        crate::paste_guard::arm();
 
         // Unmute before playing audio feedback so the stop sound is audible
         rm.remove_mute();
@@ -750,15 +754,15 @@ impl ShortcutAction for TranscribeAction {
                                 let paste_time = Instant::now();
                                 let final_text = processed.final_text;
                                 ah.run_on_main_thread(move || {
-                                    // Switched apps while it was transcribing?
-                                    // Pasting now would fire the text into
-                                    // whatever is under the cursor. Hold it and
-                                    // offer a Copy button on the pill instead.
-                                    if crate::paste_guard::target_changed() {
+                                    // Clicked or switched apps while it was
+                                    // transcribing? Pasting now would fire the
+                                    // text at whatever the caret has moved to.
+                                    // Hold it and offer a Copy button instead.
+                                    if crate::paste_guard::user_moved() {
                                         if crate::overlay::show_copy_ready_overlay(&ah_clone) {
                                             info!(
-                                                "Foreground app changed during transcription — \
-                                                 holding {} chars for Copy instead of pasting",
+                                                "User moved during transcription — holding {} \
+                                                 chars for Copy instead of pasting",
                                                 final_text.len()
                                             );
                                             crate::paste_guard::set_pending(final_text);
