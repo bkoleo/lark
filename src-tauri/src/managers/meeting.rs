@@ -314,6 +314,7 @@ impl MeetingManager {
                     *restarts + 1,
                     MAX_MIC_RESTARTS
                 );
+                let prev_device = mic.device_name();
                 let partial = mic.stop().unwrap_or_default();
                 let _ = mic.close();
                 mic_prefix.extend(partial);
@@ -323,10 +324,28 @@ impl MeetingManager {
                 let resolution = manager.resolve_mic_device();
                 *pin_missed = resolution.pin_missed;
                 match mic.open(resolution.device).and_then(|_| mic.start()) {
-                    Ok(()) => log::info!(
-                        "Meeting mic stream restarted (mic: {})",
-                        mic.device_name().unwrap_or_else(|| "default".into())
-                    ),
+                    Ok(()) => {
+                        let new_device = mic.device_name();
+                        log::info!(
+                            "Meeting mic stream restarted (mic: {})",
+                            new_device.clone().unwrap_or_else(|| "default".into())
+                        );
+                        // The budget exists to stop hopeless retries of ONE
+                        // device; landing on a different device (the pin
+                        // appeared, or the fallback changed) starts fresh —
+                        // and the pill gets the new name.
+                        if new_device != prev_device {
+                            *restarts = 0;
+                            crate::overlay::emit_meeting_mic_status(
+                                &manager.app_handle,
+                                new_device.as_deref(),
+                                true,
+                                *pin_missed,
+                            );
+                            *last_restart_ms = mic_started.elapsed().as_millis() as u64;
+                            continue;
+                        }
+                    }
                     Err(e) => log::error!("Meeting mic restart failed: {e}"),
                 }
                 *restarts += 1;
