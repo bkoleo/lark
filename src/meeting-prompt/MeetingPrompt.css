@@ -177,12 +177,15 @@
   display: block;
 }
 
-/* Collapsed while-recording indicator: subtle dark pill, pulsing dot */
+/* Collapsed while-recording indicator: subtle dark pill, pulsing dot.
+   The window is wider than the pill (room for the mic name), so the pill
+   right-aligns to stay hugged to the screen corner. */
 .meeting-mini {
   display: flex;
   align-items: center;
   gap: 7px;
-  margin: 8px 10px;
+  width: fit-content;
+  margin: 8px 10px 8px auto;
   padding: 7px 13px;
   border: none;
   border-radius: 999px;
@@ -222,6 +225,32 @@
   font-variant-numeric: tabular-nums;
   font-family:
     -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+/* Which mic the recording is actually capturing. Normal = the pinned mic;
+   amber = system-default fallback (pinned mic not attached); red = the
+   stream is delivering no audio. */
+.meeting-mini-mic {
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 11px;
+  font-weight: 500;
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border-left: 1px solid rgba(255, 255, 255, 0.25);
+  padding-left: 7px;
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+.meeting-mini-mic.warn {
+  color: #ffb340;
+}
+
+.meeting-mini-mic.err {
+  color: #ff6961;
+  font-weight: 700;
 }
 
 .meeting-mini.fade-in {

@@ -648,7 +648,9 @@
     "recordSubtitle": "this meeting",
     "stopSubtitle": "recording",
     "savedTitle": "Meeting recorded successfully",
-    "savedSubtitle": "Recorded — notes saved"
+    "savedSubtitle": "Recorded — notes saved",
+    "defaultMic": "Default mic",
+    "noAudio": "No audio"
   },
   "meetings": {
     "searchPlaceholder": "Search meetings…",

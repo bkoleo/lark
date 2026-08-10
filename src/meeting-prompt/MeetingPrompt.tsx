@@ -24,9 +24,18 @@ type Mode =
   | { view: "prompt"; payload: MeetingPromptPayload }
   | { view: "recording"; startedAt: number };
 
+/** Which mic the meeting recorder has open, and whether audio is arriving.
+ * `fallback` = system default opened because the pinned mic wasn't attached. */
+interface MicStatus {
+  mic: string | null;
+  flowing: boolean;
+  fallback: boolean;
+}
+
 const MeetingPrompt: React.FC = () => {
   const { t } = useTranslation();
   const [mode, setMode] = useState<Mode | null>(null);
+  const [micStatus, setMicStatus] = useState<MicStatus | null>(null);
   const [, setClockTick] = useState(0);
   // Survives prompt<->recording swaps so the timer doesn't reset when the
   // card expands and collapses.
@@ -47,9 +56,14 @@ const MeetingPrompt: React.FC = () => {
         }
         setMode({ view: "recording", startedAt: recordingStartRef.current });
       });
+      const unlistenMicStatus = await listen<MicStatus>(
+        "meeting-mic-status",
+        (event) => setMicStatus(event.payload),
+      );
       return () => {
         unlistenPrompt();
         unlistenRecording();
+        unlistenMicStatus();
       };
     };
     setup();
@@ -74,8 +88,10 @@ const MeetingPrompt: React.FC = () => {
   }, [mode]);
 
   const answer = (action: "record" | "stop" | "dismiss" | "expand_stop") => {
-    if (action === "record") recordingStartRef.current = null;
-    if (action === "stop") recordingStartRef.current = null;
+    if (action === "record" || action === "stop") {
+      recordingStartRef.current = null;
+      setMicStatus(null);
+    }
     setMode(null);
     invoke("meeting_prompt_action", { action });
   };
@@ -89,6 +105,21 @@ const MeetingPrompt: React.FC = () => {
     );
     const mm = String(Math.floor(elapsed / 60)).padStart(2, "0");
     const ss = String(elapsed % 60).padStart(2, "0");
+    // The mic label answers "which mic is this recording?" at a glance:
+    // normal = the pinned mic; amber = default fallback (pinned mic not
+    // attached); red NO AUDIO = the open stream is delivering silence.
+    const micLabel =
+      micStatus &&
+      (micStatus.flowing
+        ? (micStatus.mic ?? t("meetingPrompt.defaultMic"))
+        : t("meetingPrompt.noAudio"));
+    const micClass = micStatus
+      ? !micStatus.flowing
+        ? " err"
+        : micStatus.fallback
+          ? " warn"
+          : ""
+      : "";
     return (
       <button
         className="meeting-mini fade-in"
@@ -99,6 +130,9 @@ const MeetingPrompt: React.FC = () => {
         <span className="meeting-mini-time">
           {mm}:{ss}
         </span>
+        {micLabel && (
+          <span className={`meeting-mini-mic${micClass}`}>{micLabel}</span>
+        )}
       </button>
     );
   }

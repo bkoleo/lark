@@ -2,7 +2,7 @@ use crate::audio_toolkit::{list_input_devices, vad::SmoothedVad, AudioRecorder, 
 use crate::helpers::clamshell;
 use crate::settings::{get_settings, AppSettings};
 use crate::utils;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -217,14 +217,26 @@ impl AudioRecordingManager {
             settings.selected_microphone.as_ref()?
         };
 
-        // Find the device by name
+        // Find the device by name. A miss falls back to the system default,
+        // which must be loud: a silently-missed pin records the wrong mic
+        // and is indistinguishable from no pin at all.
         match list_input_devices() {
-            Ok(devices) => devices
-                .into_iter()
-                .find(|d| d.name == *device_name)
-                .map(|d| d.device),
+            Ok(devices) => {
+                let found = devices
+                    .iter()
+                    .position(|d| d.name == *device_name)
+                    .and_then(|idx| devices.into_iter().nth(idx))
+                    .map(|d| d.device);
+                if found.is_none() {
+                    warn!(
+                        "Pinned microphone {:?} is not attached — dictation will record the system default input",
+                        device_name
+                    );
+                }
+                found
+            }
             Err(e) => {
-                debug!("Failed to list devices, using default: {}", e);
+                warn!("Failed to list devices, using default: {}", e);
                 None
             }
         }

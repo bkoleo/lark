@@ -41,6 +41,9 @@ const FLOW_RMS_THRESHOLD: f32 = 1e-6;
 /// Restart the mic if no signal for this long.
 const MIC_SILENT_RESTART_MS: u64 = 3_000;
 const MAX_MIC_RESTARTS: u32 = 3;
+/// While recording on a fallback device (the pinned mic wasn't attached),
+/// look for the pinned mic this often and switch to it the moment it appears.
+const PIN_RECHECK_MS: u64 = 5_000;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum MeetingStatus {
@@ -60,6 +63,10 @@ enum MeetingState {
         flow_last_ms: Arc<AtomicU64>,
         last_restart_ms: u64,
         restarts: u32,
+        /// True while the open stream is a system-default fallback because
+        /// the pinned mic wasn't attached — the watchdog keeps hunting for
+        /// the pin and switches over the moment it appears.
+        pin_missed: bool,
         tap: SystemAudioTap,
         started: DateTime<Local>,
         /// Filled in on a background thread — the first-ever lookup can sit on
@@ -148,8 +155,9 @@ impl MeetingManager {
                     flow_clone.store(mic_started.elapsed().as_millis() as u64, Ordering::Relaxed);
                 }
             });
-        let device = self.selected_mic_device();
-        if let Err(e) = mic.open(device) {
+        let resolution = self.resolve_mic_device();
+        let pin_missed = resolution.pin_missed;
+        if let Err(e) = mic.open(resolution.device) {
             // Don't leave the tap running if the mic failed.
             let _ = tap.stop();
             return Err(anyhow!("failed to open microphone: {e}"));
@@ -159,10 +167,8 @@ impl MeetingManager {
         // The model is NOT pre-loaded here: holding 640MB through a whole
         // call would hurt on 8GB. process() loads it after the recording.
 
-        log::info!(
-            "Meeting recording started (mic: {})",
-            mic.device_name().unwrap_or_else(|| "default".into())
-        );
+        let mic_name = mic.device_name().unwrap_or_else(|| "default".into());
+        log::info!("Meeting recording started (mic: {mic_name})");
         // Resolve the calendar event off-thread; process() reads it ~an hour
         // later, so there is no race worth guarding beyond the mutex.
         let calendar = Arc::new(Mutex::new(None));
@@ -181,6 +187,7 @@ impl MeetingManager {
             flow_last_ms,
             last_restart_ms: 0,
             restarts: 0,
+            pin_missed,
             tap,
             started: Local::now(),
             calendar,
@@ -188,8 +195,11 @@ impl MeetingManager {
         drop(state);
 
         self.spawn_mic_watchdog();
-        // Always-visible while recording: the small top-right indicator.
+        // Always-visible while recording: the small top-right indicator,
+        // labelled with the mic actually being recorded so a wrong-device
+        // fallback is visible while the meeting is happening.
         crate::overlay::show_meeting_recording_indicator(&self.app_handle);
+        crate::overlay::emit_meeting_mic_status(&self.app_handle, Some(&mic_name), true, pin_missed);
         Ok(())
     }
 
@@ -197,56 +207,135 @@ impl MeetingManager {
     /// AirPods handshake failure dictation recovers from. Salvaged samples
     /// are normalised to wall-clock so the gap becomes silence instead of a
     /// timestamp shift.
+    ///
+    /// Also the recovery path for a pinned mic that wasn't attached when the
+    /// recording started (2026-08-10: the Jabra was plugged in seconds after
+    /// the standup recording began, and the old watchdog burned its whole
+    /// restart budget re-opening the silent built-in mic, then went inert
+    /// for 36 minutes). While the stream is a default fallback, the pin is
+    /// re-checked every few seconds and switched to the moment it appears;
+    /// a switch to a different device resets the silence-restart budget.
     fn spawn_mic_watchdog(self: &Arc<Self>) {
         let manager = self.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_millis(500));
-            let mut state = manager.state.lock().unwrap();
-            let MeetingState::Recording {
-                mic,
-                mic_prefix,
-                mic_started,
-                flow_last_ms,
-                last_restart_ms,
-                restarts,
-                ..
-            } = &mut *state
-            else {
-                break;
-            };
+        std::thread::spawn(move || {
+            let mut was_flowing = true;
+            let mut last_pin_check_ms = 0u64;
+            loop {
+                std::thread::sleep(Duration::from_millis(500));
+                let mut state = manager.state.lock().unwrap();
+                let MeetingState::Recording {
+                    mic,
+                    mic_prefix,
+                    mic_started,
+                    flow_last_ms,
+                    last_restart_ms,
+                    restarts,
+                    pin_missed,
+                    ..
+                } = &mut *state
+                else {
+                    break;
+                };
 
-            let now_ms = mic_started.elapsed().as_millis() as u64;
-            let last_signal = flow_last_ms.load(Ordering::Relaxed).max(*last_restart_ms);
-            if now_ms.saturating_sub(last_signal) < MIC_SILENT_RESTART_MS {
-                continue;
-            }
-            if *restarts >= MAX_MIC_RESTARTS {
-                continue; // logged on the last attempt; record whatever comes
-            }
+                let now_ms = mic_started.elapsed().as_millis() as u64;
+                let last_signal = flow_last_ms.load(Ordering::Relaxed).max(*last_restart_ms);
+                let silent_ms = now_ms.saturating_sub(last_signal);
 
-            log::warn!(
-                "Meeting mic silent for {}ms — restarting stream (attempt {}/{})",
-                now_ms - last_signal,
-                *restarts + 1,
-                MAX_MIC_RESTARTS
-            );
-            let partial = mic.stop().unwrap_or_default();
-            let _ = mic.close();
-            mic_prefix.extend(partial);
-            let expected = (mic_started.elapsed().as_secs_f64() * SAMPLE_RATE as f64) as usize;
-            fit_to_length(mic_prefix, expected);
+                // Surface silence on the recording indicator the moment it
+                // crosses the threshold, and clear it when audio returns —
+                // a silent track must be visible during the meeting, not
+                // discovered in the transcript afterwards.
+                let flowing = silent_ms < MIC_SILENT_RESTART_MS;
+                if flowing != was_flowing {
+                    was_flowing = flowing;
+                    if !flowing {
+                        log::warn!("Meeting mic delivering no audio (silent {}ms)", silent_ms);
+                    }
+                    crate::overlay::emit_meeting_mic_status(
+                        &manager.app_handle,
+                        mic.device_name().as_deref(),
+                        flowing,
+                        *pin_missed,
+                    );
+                }
 
-            let device = manager.selected_mic_device();
-            match mic.open(device).and_then(|_| mic.start()) {
-                Ok(()) => log::info!("Meeting mic stream restarted"),
-                Err(e) => log::error!("Meeting mic restart failed: {e}"),
-            }
-            *restarts += 1;
-            *last_restart_ms = mic_started.elapsed().as_millis() as u64;
-            if *restarts == MAX_MIC_RESTARTS {
-                log::error!(
-                    "Meeting mic restart limit reached — mic track may be silent from here"
+                // While on a fallback device, hunt for the pinned mic and
+                // switch over as soon as it is attached — regardless of how
+                // many silence restarts have been spent.
+                if *pin_missed && now_ms.saturating_sub(last_pin_check_ms) >= PIN_RECHECK_MS {
+                    last_pin_check_ms = now_ms;
+                    let resolution = manager.resolve_mic_device();
+                    if !resolution.pin_missed {
+                        if let Some(pinned_name) = &resolution.pinned {
+                            log::info!(
+                                "Pinned microphone {pinned_name:?} is now attached — switching mid-meeting"
+                            );
+                        }
+                        let partial = mic.stop().unwrap_or_default();
+                        let _ = mic.close();
+                        mic_prefix.extend(partial);
+                        let expected =
+                            (mic_started.elapsed().as_secs_f64() * SAMPLE_RATE as f64) as usize;
+                        fit_to_length(mic_prefix, expected);
+                        match mic.open(resolution.device).and_then(|_| mic.start()) {
+                            Ok(()) => {
+                                *pin_missed = false;
+                                // A different physical device gets a fresh
+                                // silence budget.
+                                *restarts = 0;
+                                *last_restart_ms = mic_started.elapsed().as_millis() as u64;
+                                log::info!(
+                                    "Meeting mic switched to {}",
+                                    mic.device_name().unwrap_or_else(|| "default".into())
+                                );
+                                crate::overlay::emit_meeting_mic_status(
+                                    &manager.app_handle,
+                                    mic.device_name().as_deref(),
+                                    true,
+                                    false,
+                                );
+                            }
+                            Err(e) => log::error!("Switch to pinned mic failed: {e}"),
+                        }
+                        continue;
+                    }
+                }
+
+                if silent_ms < MIC_SILENT_RESTART_MS {
+                    continue;
+                }
+                if *restarts >= MAX_MIC_RESTARTS {
+                    continue; // logged on the last attempt; record whatever comes
+                }
+
+                log::warn!(
+                    "Meeting mic silent for {}ms — restarting stream (attempt {}/{})",
+                    silent_ms,
+                    *restarts + 1,
+                    MAX_MIC_RESTARTS
                 );
+                let partial = mic.stop().unwrap_or_default();
+                let _ = mic.close();
+                mic_prefix.extend(partial);
+                let expected = (mic_started.elapsed().as_secs_f64() * SAMPLE_RATE as f64) as usize;
+                fit_to_length(mic_prefix, expected);
+
+                let resolution = manager.resolve_mic_device();
+                *pin_missed = resolution.pin_missed;
+                match mic.open(resolution.device).and_then(|_| mic.start()) {
+                    Ok(()) => log::info!(
+                        "Meeting mic stream restarted (mic: {})",
+                        mic.device_name().unwrap_or_else(|| "default".into())
+                    ),
+                    Err(e) => log::error!("Meeting mic restart failed: {e}"),
+                }
+                *restarts += 1;
+                *last_restart_ms = mic_started.elapsed().as_millis() as u64;
+                if *restarts == MAX_MIC_RESTARTS {
+                    log::error!(
+                        "Meeting mic restart limit reached — mic track may be silent from here"
+                    );
+                }
             }
         });
     }
@@ -687,22 +776,60 @@ Transcript:\n{}",
     }
 
     /// Same device resolution the dictation pipeline uses, including the
-    /// clamshell (lid closed) override.
-    fn selected_mic_device(&self) -> Option<cpal::Device> {
+    /// clamshell (lid closed) override. A pin that doesn't match any
+    /// attached device is an ERROR in the log and `pin_missed` in the
+    /// result — opening `device: None` means "system default", and a
+    /// silently-missed pin is indistinguishable from no pin at all (that
+    /// silence cost a 36-minute meeting track on 2026-08-10).
+    fn resolve_mic_device(&self) -> MicResolution {
         let settings = get_settings(&self.app_handle);
         let use_clamshell =
             clamshell::is_clamshell().unwrap_or(false) && settings.clamshell_microphone.is_some();
-        let device_name = if use_clamshell {
+        let pinned = if use_clamshell {
             settings.clamshell_microphone.clone()
         } else {
             settings.selected_microphone.clone()
-        }?;
-        list_input_devices()
-            .ok()?
-            .into_iter()
-            .find(|d| d.name == device_name)
-            .map(|d| d.device)
+        };
+        let Some(device_name) = pinned.clone() else {
+            return MicResolution {
+                device: None,
+                pinned: None,
+                pin_missed: false,
+            };
+        };
+        let devices = list_input_devices().unwrap_or_else(|e| {
+            log::error!("Failed to list input devices: {e}");
+            Vec::new()
+        });
+        match devices.iter().position(|d| d.name == device_name) {
+            Some(idx) => MicResolution {
+                device: devices.into_iter().nth(idx).map(|d| d.device),
+                pinned,
+                pin_missed: false,
+            },
+            None => {
+                log::error!(
+                    "Pinned microphone {:?} is not attached (available inputs: {:?}) — recording the system default instead",
+                    device_name,
+                    devices.iter().map(|d| d.name.as_str()).collect::<Vec<_>>()
+                );
+                MicResolution {
+                    device: None,
+                    pinned,
+                    pin_missed: true,
+                }
+            }
+        }
     }
+}
+
+/// Outcome of pinned-mic resolution: the device to open (`None` = system
+/// default), the name the settings pin asked for, and whether that pin
+/// failed to match any attached device.
+struct MicResolution {
+    device: Option<cpal::Device>,
+    pinned: Option<String>,
+    pin_missed: bool,
 }
 
 /// Truncate or zero-pad to the expected wall-clock sample count.

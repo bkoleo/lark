@@ -444,9 +444,11 @@ pub fn show_recording_overlay(app_handle: &AppHandle) {
 const MEETING_CARD_WIDTH: f64 = 360.0;
 #[cfg(target_os = "macos")]
 const MEETING_CARD_HEIGHT: f64 = 84.0;
-/// Collapsed while-recording indicator: small and unobtrusive.
+/// Collapsed while-recording indicator: small and unobtrusive, but wide
+/// enough to name the mic being recorded (the pill right-aligns inside the
+/// window, so unused width stays invisible at the screen edge).
 #[cfg(target_os = "macos")]
-const MEETING_MINI_WIDTH: f64 = 130.0;
+const MEETING_MINI_WIDTH: f64 = 260.0;
 #[cfg(target_os = "macos")]
 const MEETING_MINI_HEIGHT: f64 = 48.0;
 
@@ -555,6 +557,30 @@ pub fn show_meeting_recording_indicator(app_handle: &AppHandle) {
     if let Some(window) = app_handle.get_webview_window("meeting_prompt") {
         let _ = window.show();
         let _ = window.emit("meeting-recording", ());
+    }
+}
+
+/// Tells the recording indicator which mic is being recorded and whether it
+/// is delivering audio. `fallback` marks a system-default stream opened
+/// because the pinned mic wasn't attached — the pill renders the name in a
+/// warning tint so a wrong-device recording is visible during the meeting,
+/// not discovered in the transcript afterwards.
+#[cfg(target_os = "macos")]
+pub fn emit_meeting_mic_status(
+    app_handle: &AppHandle,
+    mic: Option<&str>,
+    flowing: bool,
+    fallback: bool,
+) {
+    if let Some(window) = app_handle.get_webview_window("meeting_prompt") {
+        let _ = window.emit(
+            "meeting-mic-status",
+            serde_json::json!({
+                "mic": mic,
+                "flowing": flowing,
+                "fallback": fallback,
+            }),
+        );
     }
 }
 
