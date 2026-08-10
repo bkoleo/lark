@@ -46,7 +46,8 @@ pub fn meeting_prompt_action(app: AppHandle, action: String) -> Result<(), Strin
                 crate::overlay::hide_meeting_prompt(&app);
             }
             "expand_stop" => {
-                crate::overlay::show_meeting_prompt(&app, "stop_ask", "");
+                let title = meeting_manager.recording_calendar_title();
+                crate::overlay::show_meeting_prompt(&app, "stop_ask", "", title.as_deref(), None);
             }
             _ => {
                 // dismiss

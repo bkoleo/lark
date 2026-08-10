@@ -1,15 +1,15 @@
-/* Granola-style meeting-detected card, top-right of the screen. */
+/* Granola-pop meeting card, top-right of the screen. Design ref:
+   Lark/design/2026-08-08-meeting-card-granola-pop-mockup.html */
 
 .meeting-card {
   display: flex;
-  align-items: center;
-  gap: 10px;
+  align-items: stretch;
   margin: 8px 10px; /* breathing room for the drop shadow */
-  padding: 10px 10px 10px 14px;
   background: #ffffff;
-  border-radius: 12px;
+  border-radius: 14px;
   border: 1px solid rgba(0, 0, 0, 0.08);
-  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.22);
+  overflow: hidden;
   font-family:
     -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   opacity: 0;
@@ -30,20 +30,55 @@
   }
 }
 
+/* Left accent bar — colour reads the card's kind at a glance: amber for
+   "meeting detected" (the default), blue for "offer to stop", green for
+   "saved". */
+.meeting-card-accent {
+  width: 4px;
+  flex-shrink: 0;
+  background: #e8a33d;
+}
+
+.meeting-card-accent.blue {
+  background: #4f8cff;
+}
+
+.meeting-card-accent.green {
+  background: #34c759;
+}
+
+.meeting-card-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 10px 12px 14px;
+}
+
+.meeting-card.saved .meeting-card-body {
+  padding-right: 14px;
+}
+
 .meeting-card-text {
   flex: 1;
   min-width: 0;
 }
 
 .meeting-card-title {
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 600;
   color: #1a1a1a;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-.meeting-card-app {
-  font-size: 11px;
-  color: #8a8a8a;
+.meeting-card-time {
+  margin-top: 2px;
+  font-size: 12px;
+  font-weight: 500;
+  color: rgba(0, 0, 0, 0.45);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -52,54 +87,79 @@
 .meeting-card-button {
   display: flex;
   align-items: center;
-  gap: 7px;
-  border: 1px solid rgba(0, 0, 0, 0.1);
-  border-radius: 9px;
-  background: #ffffff;
+  gap: 8px;
+  border: none;
+  border-radius: 10px;
+  background: #e8a33d;
   padding: 7px 12px;
-  font-size: 12px;
-  font-weight: 600;
-  color: #1a1a1a;
   cursor: pointer;
-  transition: background-color 120ms ease-out;
+  flex-shrink: 0;
+  transition: filter 120ms ease-out;
+}
+
+.meeting-card-button.blue {
+  background: #4f8cff;
 }
 
 .meeting-card-button:hover {
-  background: #f2f2f2;
+  filter: brightness(0.96);
 }
 
 .meeting-card-button:active {
-  background: #e8e8e8;
+  filter: brightness(0.9);
 }
 
-/* Lark logomark: amber rounded square with a white L */
-.meeting-card-logo {
-  width: 18px;
-  height: 18px;
-  border-radius: 5px;
-  background: #e8a33d;
-  position: relative;
+.meeting-card-button svg {
   flex-shrink: 0;
 }
 
-.meeting-card-logo::before {
-  content: "L";
-  position: absolute;
-  inset: 0;
+.meeting-card-button-label {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.15;
+  text-align: left;
+}
+
+.meeting-card-button-label .l1 {
+  font-size: 12px;
+  font-weight: 700;
+  color: #1a1200;
+}
+
+.meeting-card-button.blue .meeting-card-button-label .l1 {
+  color: #ffffff;
+}
+
+.meeting-card-button-label .l2 {
+  font-size: 10px;
+  font-weight: 500;
+  color: rgba(26, 18, 0, 0.65);
+}
+
+.meeting-card-button.blue .meeting-card-button-label .l2 {
+  color: rgba(255, 255, 255, 0.75);
+}
+
+/* saved card — checkmark instead of an action button */
+.meeting-card-check {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  color: white;
-  font-size: 12px;
-  font-weight: 700;
+  border-radius: 50%;
+  background: rgba(52, 199, 89, 0.12);
 }
 
 .meeting-card-dismiss {
   border: none;
   background: transparent;
-  color: #b0b0b0;
+  color: rgba(0, 0, 0, 0.32);
   cursor: pointer;
   padding: 4px;
+  align-self: flex-start;
+  margin-top: 2px;
   display: flex;
   align-items: center;
   border-radius: 6px;
@@ -112,8 +172,9 @@
 }
 
 .meeting-card-dismiss svg {
-  width: 12px;
-  height: 12px;
+  width: 11px;
+  height: 11px;
+  display: block;
 }
 
 /* Collapsed while-recording indicator: subtle dark pill, pulsing dot */

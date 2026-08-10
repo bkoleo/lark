@@ -94,6 +94,12 @@ mod imp {
         /// Display names of attendees, organiser first where known. Empty when
         /// the event is a solo block.
         pub attendees: Vec<String>,
+        /// Event start/end as Unix timestamps, for the card's time-range row.
+        /// `None` alongside a `Some` title is possible (title known, either
+        /// bound missing) — `format_time_range` needs both, so the card falls
+        /// back to the app name rather than a half-formed range.
+        pub start_epoch: Option<f64>,
+        pub end_epoch: Option<f64>,
     }
 
     impl CalendarContext {
@@ -153,10 +159,11 @@ mod imp {
                     }
                 }
 
+                let start_date = event.startDate();
+                let end_date = event.endDate();
                 let in_progress = {
-                    let s = event.startDate();
-                    let e = event.endDate();
-                    s.timeIntervalSinceDate(&now) <= 0.0 && e.timeIntervalSinceDate(&now) >= 0.0
+                    start_date.timeIntervalSinceDate(&now) <= 0.0
+                        && end_date.timeIntervalSinceDate(&now) >= 0.0
                 };
 
                 // Higher is better.
@@ -167,7 +174,12 @@ mod imp {
                     (false, false) => 0,
                 };
 
-                let ctx = CalendarContext { title, attendees };
+                let ctx = CalendarContext {
+                    title,
+                    attendees,
+                    start_epoch: Some(start_date.timeIntervalSince1970()),
+                    end_epoch: Some(end_date.timeIntervalSince1970()),
+                };
                 if ctx.is_empty() {
                     continue;
                 }
@@ -441,6 +453,8 @@ mod imp {
     pub struct CalendarContext {
         pub title: Option<String>,
         pub attendees: Vec<String>,
+        pub start_epoch: Option<f64>,
+        pub end_epoch: Option<f64>,
     }
 
     impl CalendarContext {
@@ -473,3 +487,56 @@ mod imp {
 }
 
 pub use imp::{current_event, next_meeting, CalendarContext, NextMeeting, UpcomingEvent};
+
+/// "1:00 PM – 2:00 PM" — 12-hour, no leading zero on the hour, en dash.
+/// Matches the Granola-pop card's time row exactly (design ref:
+/// `Lark/design/2026-08-08-meeting-card-granola-pop-mockup.html`).
+///
+/// Pure formatting, no EventKit — same split as `next_meeting()`'s own
+/// `local_hm` (SKILL.md's "make Lark log the value" pattern applies here
+/// too: this is the one piece of the calendar path unit-testable without a
+/// live calendar or a macOS build).
+pub fn format_time_range(start_epoch: f64, end_epoch: f64) -> Option<String> {
+    let start = local_h12(start_epoch)?;
+    let end = local_h12(end_epoch)?;
+    Some(format!("{start} – {end}"))
+}
+
+fn local_h12(epoch: f64) -> Option<String> {
+    let dt = chrono::DateTime::from_timestamp(epoch as i64, 0)?;
+    Some(
+        dt.with_timezone(&chrono::Local)
+            .format("%-I:%M %p")
+            .to_string(),
+    )
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::format_time_range;
+
+    #[test]
+    fn formats_a_one_hour_range() {
+        // 2026-08-08 13:00:00 UTC and 14:00:00 UTC — assert only that both
+        // halves parse and land either side of an en dash; the actual
+        // AM/PM text depends on the machine's local timezone, which this
+        // test must not assume.
+        let start = 1786280400.0_f64; // 2026-08-08 13:00:00 UTC
+        let end = 1786284000.0_f64; // 2026-08-08 14:00:00 UTC
+        let out = format_time_range(start, end).expect("both bounds present");
+        let parts: Vec<&str> = out.split(" – ").collect();
+        assert_eq!(
+            parts.len(),
+            2,
+            "expected exactly one en-dash-separated range: {out}"
+        );
+        assert!(parts[0].contains(':') && (parts[0].contains("AM") || parts[0].contains("PM")));
+        assert!(parts[1].contains(':') && (parts[1].contains("AM") || parts[1].contains("PM")));
+    }
+
+    #[test]
+    fn same_instant_still_formats_both_sides() {
+        let t = 1786280400.0_f64;
+        assert!(format_time_range(t, t).is_some());
+    }
+}

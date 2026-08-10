@@ -16,6 +16,7 @@ use cidre::core_audio as ca;
 use tauri::{AppHandle, Manager};
 
 use crate::managers::meeting::{MeetingManager, MeetingStatus};
+use crate::managers::meeting_calendar::{self, CalendarContext};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Don't nag: at most one "record this?" prompt per this window.
@@ -125,7 +126,20 @@ pub fn spawn_meeting_detector(app_handle: &AppHandle) {
                     .unwrap_or(true);
                 if cooled_down {
                     log::info!("Meeting detected: {} is using the mic", current[0]);
-                    crate::overlay::show_meeting_prompt(&app, "start", current[0]);
+                    // Read-only EventKit lookup, same call `MeetingManager::start()`
+                    // makes when the user actually clicks Record — local (no
+                    // network), so no perceptible delay before the card pops.
+                    // Recording hasn't started yet at this point, so there is
+                    // no `MeetingManager`-held calendar to read instead.
+                    let calendar = meeting_calendar::current_event();
+                    let (title, time_range) = calendar_card_fields(calendar.as_ref());
+                    crate::overlay::show_meeting_prompt(
+                        &app,
+                        "start",
+                        current[0],
+                        title.as_deref(),
+                        time_range.as_deref(),
+                    );
                     last_prompt = Some(Instant::now());
                 }
             }
@@ -135,7 +149,21 @@ pub fn spawn_meeting_detector(app_handle: &AppHandle) {
                     "Meeting app released the mic while recording — auto-stop in {}s",
                     AUTO_STOP_GRACE.as_secs()
                 );
-                crate::overlay::show_meeting_prompt(&app, "stop", previous[0]);
+                // Recording is already under way, so `MeetingManager` holds the
+                // calendar match `start()` resolved — the same one the eventual
+                // transcript will carry. Reading it here (rather than a second
+                // EventKit query) means the "stop" card can never name a
+                // different meeting than the one being recorded.
+                let title = app
+                    .try_state::<Arc<MeetingManager>>()
+                    .and_then(|m| m.recording_calendar_title());
+                crate::overlay::show_meeting_prompt(
+                    &app,
+                    "stop",
+                    previous[0],
+                    title.as_deref(),
+                    None,
+                );
                 call_end_grace = Some(Instant::now());
             }
 
@@ -170,6 +198,21 @@ pub fn spawn_meeting_detector(app_handle: &AppHandle) {
             previous = current;
         }
     });
+}
+
+/// The card's title + time-range text for a resolved calendar match, or
+/// `(None, None)` when nothing matched — the card itself falls back to the
+/// app name in that case, per the Granola-pop design
+/// (`Lark/design/2026-08-08-meeting-card-granola-pop-mockup.html`).
+fn calendar_card_fields(ctx: Option<&CalendarContext>) -> (Option<String>, Option<String>) {
+    let Some(ctx) = ctx else {
+        return (None, None);
+    };
+    let time_range = match (ctx.start_epoch, ctx.end_epoch) {
+        (Some(s), Some(e)) => meeting_calendar::format_time_range(s, e),
+        _ => None,
+    };
+    (ctx.title.clone(), time_range)
 }
 
 /// Friendly names of known meeting apps currently holding the microphone.

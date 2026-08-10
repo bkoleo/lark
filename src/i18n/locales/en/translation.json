@@ -641,10 +641,14 @@
   "meetingPrompt": {
     "detected": "Meeting detected",
     "ended": "Call ended",
+    "endedWithTitle": "Call ended — stop recording?",
+    "stopPrompt": "Stop recording?",
     "dismiss": "Dismiss",
     "recording": "Recording meeting",
+    "recordSubtitle": "this meeting",
+    "stopSubtitle": "recording",
     "savedTitle": "Meeting recorded successfully",
-    "savedSubtitle": "Notes saved to your Meetings"
+    "savedSubtitle": "Recorded — notes saved"
   },
   "meetings": {
     "searchPlaceholder": "Search meetings…",

@@ -102,6 +102,20 @@ impl MeetingManager {
         }
     }
 
+    /// The calendar event title matched at `start()`, if a recording is
+    /// active and the calendar resolved one — for the "stop" / "stop_ask"
+    /// cards, so they name the same meeting the eventual transcript will.
+    /// `None` while idle/processing, while the calendar lookup is still
+    /// running, or when nothing matched.
+    pub fn recording_calendar_title(&self) -> Option<String> {
+        let state = self.state.lock().unwrap();
+        let MeetingState::Recording { calendar, .. } = &*state else {
+            return None;
+        };
+        let title = calendar.lock().unwrap().as_ref()?.title.clone();
+        title
+    }
+
     pub fn toggle(self: &Arc<Self>) {
         match self.status() {
             MeetingStatus::Idle => {
@@ -306,6 +320,9 @@ impl MeetingManager {
         let manager = self.clone();
         std::thread::spawn(move || {
             let calendar = calendar.lock().unwrap().clone();
+            // Cloned before `process()` takes ownership — the "saved" card
+            // below wants the same title, not a re-derived one.
+            let saved_title = calendar.as_ref().and_then(|c| c.title.clone());
             let result = manager.process(mic_samples, sys_samples, started, calendar);
             *manager.state.lock().unwrap() = MeetingState::Idle;
             crate::tray::update_tray_menu(
@@ -323,7 +340,13 @@ impl MeetingManager {
                     // Visible "it's done" beat. The card is an always-on-top
                     // panel, so this confirmation shows even while the main
                     // window is hidden during/after a call.
-                    crate::overlay::show_meeting_prompt(&manager.app_handle, "saved", "");
+                    crate::overlay::show_meeting_prompt(
+                        &manager.app_handle,
+                        "saved",
+                        "",
+                        saved_title.as_deref(),
+                        None,
+                    );
                 }
                 Err(e) => log::error!("Meeting transcription failed: {e}"),
             }

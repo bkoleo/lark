@@ -2,13 +2,22 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import React, { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { CancelIcon } from "../components/icons";
+import {
+  CancelIcon,
+  CheckIcon,
+  RecordIcon,
+  StopIcon,
+} from "../components/icons";
 import { syncLanguageFromSettings } from "@/i18n";
 import "./MeetingPrompt.css";
 
 interface MeetingPromptPayload {
   kind: "start" | "stop" | "stop_ask" | "saved";
   app: string;
+  /** Real calendar event title, when the calendar matched. */
+  title?: string | null;
+  /** Pre-formatted "1:00 PM – 2:00 PM", when both bounds were known. */
+  time_range?: string | null;
 }
 
 type Mode =
@@ -74,7 +83,10 @@ const MeetingPrompt: React.FC = () => {
   if (!mode) return null;
 
   if (mode.view === "recording") {
-    const elapsed = Math.max(0, Math.floor((Date.now() - mode.startedAt) / 1000));
+    const elapsed = Math.max(
+      0,
+      Math.floor((Date.now() - mode.startedAt) / 1000),
+    );
     const mm = String(Math.floor(elapsed / 60)).padStart(2, "0");
     const ss = String(elapsed % 60).padStart(2, "0");
     return (
@@ -92,20 +104,86 @@ const MeetingPrompt: React.FC = () => {
   }
 
   const { payload } = mode;
+  const hasCalendarTitle = !!payload.title;
 
   // "Recorded successfully" closure beat shown after a meeting transcript is
   // written — reassurance without stealing focus, then auto-dismisses.
   if (payload.kind === "saved") {
     return (
-      <div className="meeting-card fade-in">
-        <div className="meeting-card-text">
-          <div className="meeting-card-title">
-            {t("meetingPrompt.savedTitle")}
+      <div className="meeting-card saved fade-in">
+        <div className="meeting-card-accent green" />
+        <div className="meeting-card-body">
+          <div className="meeting-card-check">
+            <CheckIcon width={12} height={12} color="#248a3d" />
           </div>
-          <div className="meeting-card-app">
-            {t("meetingPrompt.savedSubtitle")}
+          <div className="meeting-card-text">
+            <div className="meeting-card-title">
+              {payload.title || t("meetingPrompt.savedTitle")}
+            </div>
+            <div className="meeting-card-time">
+              {t("meetingPrompt.savedSubtitle")}
+            </div>
           </div>
+          <button
+            className="meeting-card-dismiss"
+            onClick={() => answer("dismiss")}
+            aria-label={t("meetingPrompt.dismiss")}
+          >
+            <CancelIcon />
+          </button>
         </div>
+      </div>
+    );
+  }
+
+  // "start" offers to record; "stop"/"stop_ask" offer to stop (call ended,
+  // or the user expanded the recording pill to stop manually).
+  const isStart = payload.kind === "start";
+
+  const title =
+    payload.title ||
+    (isStart
+      ? t("meetingPrompt.detected")
+      : payload.kind === "stop"
+        ? t("meetingPrompt.ended")
+        : t("meetingPrompt.recording"));
+
+  const subtitle = isStart
+    ? payload.time_range || payload.app
+    : payload.kind === "stop"
+      ? hasCalendarTitle
+        ? t("meetingPrompt.endedWithTitle")
+        : t("meetingPrompt.stopPrompt")
+      : t("meetingPrompt.stopPrompt");
+
+  return (
+    <div className="meeting-card fade-in">
+      <div className={`meeting-card-accent${isStart ? "" : " blue"}`} />
+      <div className="meeting-card-body">
+        <div className="meeting-card-text">
+          <div className="meeting-card-title">{title}</div>
+          <div className="meeting-card-time">{subtitle}</div>
+        </div>
+        <button
+          className={`meeting-card-button${isStart ? "" : " blue"}`}
+          onClick={() => answer(isStart ? "record" : "stop")}
+        >
+          {isStart ? (
+            <RecordIcon width={16} height={16} color="#1a1200" />
+          ) : (
+            <StopIcon width={16} height={16} color="#ffffff" />
+          )}
+          <span className="meeting-card-button-label">
+            <span className="l1">
+              {isStart ? t("overlay.record") : t("overlay.stop")}
+            </span>
+            <span className="l2">
+              {isStart
+                ? t("meetingPrompt.recordSubtitle")
+                : t("meetingPrompt.stopSubtitle")}
+            </span>
+          </span>
+        </button>
         <button
           className="meeting-card-dismiss"
           onClick={() => answer("dismiss")}
@@ -114,38 +192,6 @@ const MeetingPrompt: React.FC = () => {
           <CancelIcon />
         </button>
       </div>
-    );
-  }
-
-  const title =
-    payload.kind === "start"
-      ? t("meetingPrompt.detected")
-      : payload.kind === "stop"
-        ? t("meetingPrompt.ended")
-        : t("meetingPrompt.recording");
-
-  return (
-    <div className="meeting-card fade-in">
-      <div className="meeting-card-text">
-        <div className="meeting-card-title">{title}</div>
-        {payload.app !== "" && (
-          <div className="meeting-card-app">{payload.app}</div>
-        )}
-      </div>
-      <button
-        className="meeting-card-button"
-        onClick={() => answer(payload.kind === "start" ? "record" : "stop")}
-      >
-        <span className="meeting-card-logo" />
-        {payload.kind === "start" ? t("overlay.record") : t("overlay.stop")}
-      </button>
-      <button
-        className="meeting-card-dismiss"
-        onClick={() => answer("dismiss")}
-        aria-label={t("meetingPrompt.dismiss")}
-      >
-        <CancelIcon />
-      </button>
     </div>
   );
 };

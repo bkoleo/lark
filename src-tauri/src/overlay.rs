@@ -441,7 +441,7 @@ pub fn show_recording_overlay(app_handle: &AppHandle) {
 }
 
 #[cfg(target_os = "macos")]
-const MEETING_CARD_WIDTH: f64 = 340.0;
+const MEETING_CARD_WIDTH: f64 = 360.0;
 #[cfg(target_os = "macos")]
 const MEETING_CARD_HEIGHT: f64 = 84.0;
 /// Collapsed while-recording indicator: small and unobtrusive.
@@ -516,17 +516,32 @@ pub fn create_meeting_prompt_window(app_handle: &AppHandle) {
     }
 }
 
-/// Shows the Granola-style meeting card: "Meeting detected / <app> /
-/// [Record]". kind is "start" (call began, offer to record) or "stop"
-/// (call ended while recording, offer to stop & transcribe).
+/// Shows the Granola-pop meeting card: a real calendar event title + time
+/// range when known (`title`/`time_range`), falling back to the app name
+/// otherwise. `kind` is "start" (call began, offer to record), "stop"
+/// (call ended while recording, offer to stop & transcribe), "stop_ask"
+/// (user expanded the mini pill to stop manually), or "saved" (transcript
+/// written). `title`/`time_range` are `None` whenever the calendar didn't
+/// match — the card's own fallback text is what carries the app name then.
 #[cfg(target_os = "macos")]
-pub fn show_meeting_prompt(app_handle: &AppHandle, kind: &str, app_name: &str) {
+pub fn show_meeting_prompt(
+    app_handle: &AppHandle,
+    kind: &str,
+    app_name: &str,
+    title: Option<&str>,
+    time_range: Option<&str>,
+) {
     place_meeting_window(app_handle, MEETING_CARD_WIDTH, MEETING_CARD_HEIGHT);
     if let Some(window) = app_handle.get_webview_window("meeting_prompt") {
         let _ = window.show();
         let _ = window.emit(
             "meeting-prompt",
-            serde_json::json!({ "kind": kind, "app": app_name }),
+            serde_json::json!({
+                "kind": kind,
+                "app": app_name,
+                "title": title,
+                "time_range": time_range,
+            }),
         );
     }
 }
