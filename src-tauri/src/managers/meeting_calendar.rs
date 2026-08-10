@@ -29,9 +29,63 @@
 
 #[cfg(target_os = "macos")]
 mod imp {
+    use objc2::rc::{autoreleasepool, Retained};
     use objc2_event_kit::{EKAuthorizationStatus, EKEntityType, EKEventStore};
     use objc2_foundation::{NSArray, NSDate, NSString};
+    use std::cell::OnceCell;
     use std::time::Duration;
+
+    thread_local! {
+        /// One EventKit store for the life of this thread. See [`with_store`].
+        static STORE: OnceCell<Retained<EKEventStore>> = const { OnceCell::new() };
+    }
+
+    /// Run `f` against this thread's calendar store, freshened first.
+    ///
+    /// **Holding one store is the fix for a real bug, not a micro-optimisation.**
+    /// Building a throw-away `EKEventStore` per lookup made the menu bar go
+    /// blind: EventKit served the first ten stores a process created and then
+    /// returned an **empty event list** — not an error — to every one after
+    /// that. The tray timer burns one every 30 seconds, so the label counted
+    /// down correctly for exactly five minutes after each launch and then
+    /// announced "Meetings done" for the rest of the day. Observed five times
+    /// over on 2026-08-10, each run failing on the eleventh tick to the second,
+    /// with a real 09:00 standup on the calendar throughout. The reason it
+    /// surfaced as a confident wrong answer rather than a visible failure is
+    /// that an empty list is exactly what a genuinely clear diary looks like.
+    ///
+    /// Two things went wrong together and both are fixed here. The stores were
+    /// never actually being freed — this thread has no autorelease pool, so
+    /// every object EventKit autoreleased internally leaked and each store kept
+    /// its connection to `CalendarAgent` open forever, until the process hit the
+    /// per-app connection ceiling. Hence both the single store *and* the
+    /// [`autoreleasepool`] wrapping every lookup below. Apple's own guidance
+    /// arrives at the same place from the other direction: create one store and
+    /// keep it for the lifetime of the app.
+    ///
+    /// `reset()` is what makes a long-lived store safe to hold. A store serves
+    /// the calendar state it has already loaded, so without it a meeting added
+    /// mid-morning would never appear. It invalidates every object previously
+    /// fetched through the store, so nothing may be held across calls — nothing
+    /// is; each lookup copies out plain Rust values before returning. It resets
+    /// the *data*, not the connection, which is why it does not walk back into
+    /// the exhaustion above.
+    ///
+    /// Thread-local rather than one global because `Retained` is not `Sync`, and
+    /// per-thread is bounded anyway: the tray timer and the recording path are
+    /// the only callers.
+    fn with_store<T>(f: impl FnOnce(&EKEventStore) -> T) -> T {
+        STORE.with(|cell| {
+            let store = cell.get_or_init(|| {
+                log::info!("Opening the calendar store (once per thread, kept open)");
+                // Safety: a plain EventKit allocation, kept alive by the cell.
+                unsafe { EKEventStore::new() }
+            });
+            // Safety: no object fetched through the store outlives a lookup.
+            unsafe { store.reset() };
+            autoreleasepool(|_| f(store))
+        })
+    }
 
     /// What the calendar knows about the meeting being recorded.
     #[derive(Debug, Clone, Default)]
@@ -53,12 +107,9 @@ mod imp {
     /// that must not care.
     pub fn current_event() -> Option<CalendarContext> {
         // Safety: every call below is a standard EventKit read on the calling
-        // thread. The store is created and dropped here, so nothing outlives
-        // this function.
-        unsafe {
-            let store = EKEventStore::new();
-
-            if !ensure_access(&store) {
+        // thread, and nothing fetched through the store outlives this function.
+        with_store(|store| unsafe {
+            if !ensure_access(store) {
                 return None;
             }
 
@@ -126,7 +177,7 @@ mod imp {
             }
 
             best.map(|(_, ctx)| ctx)
-        }
+        })
     }
 
     /// ±10 minutes around now. Wide enough for a late start, narrow enough not
@@ -169,13 +220,12 @@ mod imp {
     /// permission dialog unbidden, thirty seconds after launch, over whatever
     /// the user was actually doing.
     pub fn next_meeting() -> NextMeeting {
-        unsafe {
-            if !has_access() {
-                return NextMeeting::Unavailable;
-            }
+        // Safety as in `current_event`: reads only, nothing outlives the call.
+        if !unsafe { has_access() } {
+            return NextMeeting::Unavailable;
+        }
 
-            let store = EKEventStore::new();
-
+        with_store(|store| unsafe {
             // Only today. "Nothing left today" is a meaningful, restful state;
             // showing tomorrow's 9am standup all evening is not.
             let start = NSDate::dateWithTimeIntervalSinceNow(-(GRACE.as_secs() as f64));
@@ -185,6 +235,8 @@ mod imp {
                 store.predicateForEventsWithStartDate_endDate_calendars(&start, &end, None);
             let events: objc2::rc::Retained<NSArray<objc2_event_kit::EKEvent>> =
                 store.eventsMatchingPredicate(&predicate);
+
+            log_event_count(events.iter().count());
 
             let now_epoch = NSDate::now().timeIntervalSince1970();
 
@@ -232,7 +284,34 @@ mod imp {
                 Some((_, ev)) => NextMeeting::Upcoming(ev),
                 None => NextMeeting::Clear,
             }
+        })
+    }
+
+    /// How many events the store handed back, before any filtering.
+    ///
+    /// This is the tripwire for the exhaustion bug described on [`with_store`],
+    /// and it exists because the bug is otherwise unfalsifiable: a broken
+    /// lookup and a genuinely clear afternoon produce the identical menu bar
+    /// label, so "Meetings done" can never confirm the fix on its own. The raw
+    /// count can. It counts what the predicate returned rather than what
+    /// survived the filters, so all-day holiday banners and birthdays keep it
+    /// above zero on days with no meetings at all — a store that has stopped
+    /// answering drops it to zero and pins it there.
+    ///
+    /// Logged only when the number moves, which is a handful of lines a day.
+    fn log_event_count(count: usize) {
+        use std::sync::Mutex;
+        static LAST: Mutex<Option<usize>> = Mutex::new(None);
+
+        let mut last = match LAST.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if *last == Some(count) {
+            return;
         }
+        *last = Some(count);
+        log::debug!("Calendar returned {} events for the rest of today", count);
     }
 
     /// True only when access is already granted. Reads the decision, never asks.
