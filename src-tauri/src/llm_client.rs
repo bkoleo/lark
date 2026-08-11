@@ -3,6 +3,15 @@ use log::debug;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, REFERER, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::Duration;
+
+/// Both meeting-notes summaries and dictation post-process cleanups go through this
+/// client. 60s covers a real DeepSeek round trip (a short meeting summary is ~530
+/// tokens) with room for a long dictation cleanup, while still capping a hung request
+/// well under the meeting flow's own processing-window expectations. A failed call
+/// (timeout included) is handled by the caller: meeting_notes writes the error into
+/// the transcript's Notes section rather than losing the transcript.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Serialize)]
 struct ChatMessage {
@@ -101,6 +110,7 @@ fn create_client(provider: &PostProcessProvider, api_key: &str) -> Result<reqwes
     let headers = build_headers(provider, api_key)?;
     reqwest::Client::builder()
         .default_headers(headers)
+        .timeout(REQUEST_TIMEOUT)
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))
 }
