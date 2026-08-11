@@ -41,9 +41,10 @@ const FLOW_RMS_THRESHOLD: f32 = 1e-6;
 /// Restart the mic if no signal for this long.
 const MIC_SILENT_RESTART_MS: u64 = 3_000;
 const MAX_MIC_RESTARTS: u32 = 3;
-/// While recording on a fallback device (the pinned mic wasn't attached),
-/// look for the pinned mic this often and switch to it the moment it appears.
-const PIN_RECHECK_MS: u64 = 5_000;
+/// While recording, re-resolve the wanted mic this often — the call's mic
+/// appearing or changing, or a late-attached pin — and switch the moment
+/// the answer differs from the open device.
+const MIC_RECHECK_MS: u64 = 5_000;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum MeetingStatus {
@@ -52,6 +53,12 @@ pub enum MeetingStatus {
     Processing,
 }
 
+/// Recording lifecycle only. Transcription of a *stopped* meeting is NOT a
+/// state here — it runs on detached threads counted by
+/// `MeetingManager::processing`, so a new recording can always start while
+/// the previous meeting is still transcribing (2026-08-11: a back-to-back
+/// call could not be recorded at all — prompt AND manual trigger were both
+/// swallowed — because the 30-minute standup before it was still processing).
 enum MeetingState {
     Idle,
     Recording {
@@ -64,9 +71,9 @@ enum MeetingState {
         last_restart_ms: u64,
         restarts: u32,
         /// True while the open stream is a system-default fallback because
-        /// the pinned mic wasn't attached — the watchdog keeps hunting for
-        /// the pin and switches over the moment it appears.
-        pin_missed: bool,
+        /// a wanted device (the call's mic or the pin) wasn't attached —
+        /// shows amber on the pill until a re-check lands on a real target.
+        fallback: bool,
         tap: SystemAudioTap,
         started: DateTime<Local>,
         /// Filled in on a background thread — the first-ever lookup can sit on
@@ -74,12 +81,14 @@ enum MeetingState {
         /// nothing about starting a recording may wait for that.
         calendar: Arc<Mutex<Option<CalendarContext>>>,
     },
-    Processing,
 }
 
 pub struct MeetingManager {
     app_handle: AppHandle,
     state: Mutex<MeetingState>,
+    /// In-flight transcriptions of stopped meetings. Only the tray label and
+    /// the recovery CLI read it — it never gates a new recording.
+    processing: std::sync::atomic::AtomicU32,
 }
 
 impl MeetingManager {
@@ -98,14 +107,20 @@ impl MeetingManager {
         Self {
             app_handle: app_handle.clone(),
             state: Mutex::new(MeetingState::Idle),
+            processing: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
     pub fn status(&self) -> MeetingStatus {
         match *self.state.lock().unwrap() {
-            MeetingState::Idle => MeetingStatus::Idle,
             MeetingState::Recording { .. } => MeetingStatus::Recording,
-            MeetingState::Processing => MeetingStatus::Processing,
+            MeetingState::Idle => {
+                if self.processing.load(Ordering::Relaxed) > 0 {
+                    MeetingStatus::Processing
+                } else {
+                    MeetingStatus::Idle
+                }
+            }
         }
     }
 
@@ -125,15 +140,14 @@ impl MeetingManager {
 
     pub fn toggle(self: &Arc<Self>) {
         match self.status() {
-            MeetingStatus::Idle => {
+            // Processing must not block a new recording: transcription runs
+            // on its own thread, and a back-to-back call won't wait for it.
+            MeetingStatus::Idle | MeetingStatus::Processing => {
                 if let Err(e) = self.start() {
                     log::error!("Failed to start meeting recording: {e}");
                 }
             }
             MeetingStatus::Recording => self.stop_and_process(),
-            MeetingStatus::Processing => {
-                log::warn!("Meeting transcription still in progress; ignoring toggle");
-            }
         }
     }
 
@@ -156,7 +170,8 @@ impl MeetingManager {
                 }
             });
         let resolution = self.resolve_mic_device();
-        let pin_missed = resolution.pin_missed;
+        let fallback = resolution.fallback;
+        let source = resolution.source;
         if let Err(e) = mic.open(resolution.device) {
             // Don't leave the tap running if the mic failed.
             let _ = tap.stop();
@@ -168,7 +183,7 @@ impl MeetingManager {
         // call would hurt on 8GB. process() loads it after the recording.
 
         let mic_name = mic.device_name().unwrap_or_else(|| "default".into());
-        log::info!("Meeting recording started (mic: {mic_name})");
+        log::info!("Meeting recording started (mic: {mic_name}, via {source})");
         // Resolve the calendar event off-thread; process() reads it ~an hour
         // later, so there is no race worth guarding beyond the mutex.
         let calendar = Arc::new(Mutex::new(None));
@@ -187,7 +202,7 @@ impl MeetingManager {
             flow_last_ms,
             last_restart_ms: 0,
             restarts: 0,
-            pin_missed,
+            fallback,
             tap,
             started: Local::now(),
             calendar,
@@ -199,7 +214,7 @@ impl MeetingManager {
         // labelled with the mic actually being recorded so a wrong-device
         // fallback is visible while the meeting is happening.
         crate::overlay::show_meeting_recording_indicator(&self.app_handle);
-        crate::overlay::emit_meeting_mic_status(&self.app_handle, Some(&mic_name), true, pin_missed);
+        crate::overlay::emit_meeting_mic_status(&self.app_handle, Some(&mic_name), true, fallback);
         Ok(())
     }
 
@@ -219,7 +234,7 @@ impl MeetingManager {
         let manager = self.clone();
         std::thread::spawn(move || {
             let mut was_flowing = true;
-            let mut last_pin_check_ms = 0u64;
+            let mut last_target_check_ms = 0u64;
             loop {
                 std::thread::sleep(Duration::from_millis(500));
                 let mut state = manager.state.lock().unwrap();
@@ -230,7 +245,7 @@ impl MeetingManager {
                     flow_last_ms,
                     last_restart_ms,
                     restarts,
-                    pin_missed,
+                    fallback,
                     ..
                 } = &mut *state
                 else {
@@ -255,22 +270,34 @@ impl MeetingManager {
                         &manager.app_handle,
                         mic.device_name().as_deref(),
                         flowing,
-                        *pin_missed,
+                        *fallback,
                     );
                 }
 
-                // While on a fallback device, hunt for the pinned mic and
-                // switch over as soon as it is attached — regardless of how
-                // many silence restarts have been spent.
-                if *pin_missed && now_ms.saturating_sub(last_pin_check_ms) >= PIN_RECHECK_MS {
-                    last_pin_check_ms = now_ms;
+                // Re-resolve the wanted device on a timer — the call's mic
+                // appearing or CHANGING (the meeting app switched input
+                // mid-call), or a late-attached pin — and switch the moment
+                // a named, attached target differs from the open device.
+                // Runs regardless of how many silence restarts were spent:
+                // the budget caps hopeless retries of one device, never
+                // recovery onto a different one.
+                if now_ms.saturating_sub(last_target_check_ms) >= MIC_RECHECK_MS {
+                    last_target_check_ms = now_ms;
                     let resolution = manager.resolve_mic_device();
-                    if !resolution.pin_missed {
-                        if let Some(pinned_name) = &resolution.pinned {
-                            log::info!(
-                                "Pinned microphone {pinned_name:?} is now attached — switching mid-meeting"
-                            );
-                        }
+                    let current = mic.device_name();
+                    let wants_switch = match (&resolution.target, resolution.fallback) {
+                        (Some(target), false) => current.as_deref() != Some(target.as_str()),
+                        // No named target (plain default), or the target
+                        // isn't attached: keep whatever stream is open —
+                        // never tear down a live track for "default".
+                        _ => false,
+                    };
+                    if wants_switch {
+                        log::info!(
+                            "Meeting mic target is now {:?} (via {}) — switching mid-meeting",
+                            resolution.target.as_deref().unwrap_or("?"),
+                            resolution.source
+                        );
                         let partial = mic.stop().unwrap_or_default();
                         let _ = mic.close();
                         mic_prefix.extend(partial);
@@ -279,7 +306,7 @@ impl MeetingManager {
                         fit_to_length(mic_prefix, expected);
                         match mic.open(resolution.device).and_then(|_| mic.start()) {
                             Ok(()) => {
-                                *pin_missed = false;
+                                *fallback = false;
                                 // A different physical device gets a fresh
                                 // silence budget.
                                 *restarts = 0;
@@ -295,9 +322,25 @@ impl MeetingManager {
                                     false,
                                 );
                             }
-                            Err(e) => log::error!("Switch to pinned mic failed: {e}"),
+                            Err(e) => log::error!("Switch to {} failed: {e}", resolution.source),
                         }
                         continue;
+                    } else if *fallback
+                        && !resolution.fallback
+                        && resolution.target.is_some()
+                        && current.as_deref() == resolution.target.as_deref()
+                    {
+                        // The open device became the wanted one without a
+                        // switch (e.g. the pin names the default we already
+                        // fell back to) — clear the amber without touching
+                        // the stream.
+                        *fallback = false;
+                        crate::overlay::emit_meeting_mic_status(
+                            &manager.app_handle,
+                            current.as_deref(),
+                            was_flowing,
+                            false,
+                        );
                     }
                 }
 
@@ -322,7 +365,7 @@ impl MeetingManager {
                 fit_to_length(mic_prefix, expected);
 
                 let resolution = manager.resolve_mic_device();
-                *pin_missed = resolution.pin_missed;
+                *fallback = resolution.fallback;
                 match mic.open(resolution.device).and_then(|_| mic.start()) {
                     Ok(()) => {
                         let new_device = mic.device_name();
@@ -340,7 +383,7 @@ impl MeetingManager {
                                 &manager.app_handle,
                                 new_device.as_deref(),
                                 true,
-                                *pin_missed,
+                                *fallback,
                             );
                             *last_restart_ms = mic_started.elapsed().as_millis() as u64;
                             continue;
@@ -362,7 +405,7 @@ impl MeetingManager {
     fn stop_and_process(self: &Arc<Self>) {
         let (mut mic, mic_prefix, mic_started, restarts, tap, started, calendar) = {
             let mut state = self.state.lock().unwrap();
-            match std::mem::replace(&mut *state, MeetingState::Processing) {
+            match std::mem::replace(&mut *state, MeetingState::Idle) {
                 MeetingState::Recording {
                     mic,
                     mic_prefix,
@@ -426,18 +469,26 @@ impl MeetingManager {
         );
 
         let manager = self.clone();
+        self.processing.fetch_add(1, Ordering::SeqCst);
         std::thread::spawn(move || {
+            // Decrements on every exit, panic included — a leaked count would
+            // pin the tray label and block the recovery CLI forever.
+            let _guard = ProcessingGuard(&manager.processing);
             let calendar = calendar.lock().unwrap().clone();
             // Cloned before `process()` takes ownership — the "saved" card
             // below wants the same title, not a re-derived one.
             let saved_title = calendar.as_ref().and_then(|c| c.title.clone());
             let result = manager.process(mic_samples, sys_samples, started, calendar);
-            *manager.state.lock().unwrap() = MeetingState::Idle;
-            crate::tray::update_tray_menu(
-                &manager.app_handle,
-                &crate::tray::TrayIconState::Idle,
-                None,
-            );
+            drop(_guard);
+            // A new recording may have started while this one transcribed —
+            // only reset the tray when nothing is live.
+            if manager.status() != MeetingStatus::Recording {
+                crate::tray::update_tray_menu(
+                    &manager.app_handle,
+                    &crate::tray::TrayIconState::Idle,
+                    None,
+                );
+            }
             match result {
                 Ok(path) => {
                     log::info!("Meeting transcript written to {}", path.display());
@@ -525,16 +576,19 @@ impl MeetingManager {
             sys_samples.len() as f32 / SAMPLE_RATE as f32,
         );
 
-        *self.state.lock().unwrap() = MeetingState::Processing;
+        self.processing.fetch_add(1, Ordering::SeqCst);
         let manager = self.clone();
         std::thread::spawn(move || {
+            let _guard = ProcessingGuard(&manager.processing);
             let result = manager.process(mic_samples, sys_samples, started, None);
-            *manager.state.lock().unwrap() = MeetingState::Idle;
-            crate::tray::update_tray_menu(
-                &manager.app_handle,
-                &crate::tray::TrayIconState::Idle,
-                None,
-            );
+            drop(_guard);
+            if manager.status() != MeetingStatus::Recording {
+                crate::tray::update_tray_menu(
+                    &manager.app_handle,
+                    &crate::tray::TrayIconState::Idle,
+                    None,
+                );
+            }
             match result {
                 Ok(path) => log::info!("Meeting re-transcribed to {}", path.display()),
                 Err(e) => log::error!("Meeting re-transcription failed: {e}"),
@@ -794,12 +848,19 @@ Transcript:\n{}",
             .filter(|t| !t.is_empty()))
     }
 
-    /// Same device resolution the dictation pipeline uses, including the
-    /// clamshell (lid closed) override. A pin that doesn't match any
-    /// attached device is an ERROR in the log and `pin_missed` in the
-    /// result — opening `device: None` means "system default", and a
-    /// silently-missed pin is indistinguishable from no pin at all (that
-    /// silence cost a 36-minute meeting track on 2026-08-10).
+    /// Where the meeting mic track should come from, in precedence order:
+    ///
+    /// 1. **The call's own mic** — whatever input device the meeting app is
+    ///    actually capturing from. If the call can hear Kole, so can Lark
+    ///    (2026-08-10: the pin said Jabra, the call ran on another mic, and
+    ///    36 minutes of his side were lost while the pill said "No audio").
+    /// 2. **The pin** (same clamshell override as dictation).
+    /// 3. **The system default.**
+    ///
+    /// A wanted device (the call's or the pin) that can't be opened is an
+    /// ERROR in the log and `fallback` in the result — opening
+    /// `device: None` means "system default", and a silently-missed target
+    /// is indistinguishable from no target at all.
     fn resolve_mic_device(&self) -> MicResolution {
         let settings = get_settings(&self.app_handle);
         let use_clamshell =
@@ -809,22 +870,48 @@ Transcript:\n{}",
         } else {
             settings.selected_microphone.clone()
         };
-        let Some(device_name) = pinned.clone() else {
-            return MicResolution {
-                device: None,
-                pinned: None,
-                pin_missed: false,
-            };
-        };
         let devices = list_input_devices().unwrap_or_else(|e| {
             log::error!("Failed to list input devices: {e}");
             Vec::new()
         });
+
+        let own_pid = std::process::id() as i32;
+        if let Some(call) = super::meeting_detect::call_mic(own_pid) {
+            match devices.iter().position(|d| d.name == call.device_name) {
+                Some(idx) => {
+                    return MicResolution {
+                        device: devices.into_iter().nth(idx).map(|d| d.device),
+                        target: Some(call.device_name),
+                        source: MicSource::Call(call.app),
+                        fallback: false,
+                    };
+                }
+                // Core Audio names it, cpal doesn't — can't open it, so fall
+                // through to the pin, but loudly: the recorded track is not
+                // what the call hears.
+                None => log::error!(
+                    "{} is capturing from {:?} but no cpal input matches that name (available: {:?}) — falling back to the pin",
+                    call.app,
+                    call.device_name,
+                    devices.iter().map(|d| d.name.as_str()).collect::<Vec<_>>()
+                ),
+            }
+        }
+
+        let Some(device_name) = pinned.clone() else {
+            return MicResolution {
+                device: None,
+                target: None,
+                source: MicSource::Default,
+                fallback: false,
+            };
+        };
         match devices.iter().position(|d| d.name == device_name) {
             Some(idx) => MicResolution {
                 device: devices.into_iter().nth(idx).map(|d| d.device),
-                pinned,
-                pin_missed: false,
+                target: pinned,
+                source: MicSource::Pin,
+                fallback: false,
             },
             None => {
                 log::error!(
@@ -834,21 +921,55 @@ Transcript:\n{}",
                 );
                 MicResolution {
                     device: None,
-                    pinned,
-                    pin_missed: true,
+                    target: pinned,
+                    source: MicSource::Default,
+                    fallback: true,
                 }
             }
         }
     }
 }
 
-/// Outcome of pinned-mic resolution: the device to open (`None` = system
-/// default), the name the settings pin asked for, and whether that pin
-/// failed to match any attached device.
+/// Why the meeting mic resolution chose its device — for the log, so a
+/// transcript with a surprising track can be traced to a decision.
+#[derive(Clone, Copy)]
+enum MicSource {
+    /// The input device the call's meeting app is capturing from.
+    Call(&'static str),
+    /// The settings pin (or its clamshell override).
+    Pin,
+    /// No specific target — the system default.
+    Default,
+}
+
+impl std::fmt::Display for MicSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MicSource::Call(app) => write!(f, "the {app} call's mic"),
+            MicSource::Pin => write!(f, "the pinned mic"),
+            MicSource::Default => write!(f, "the system default"),
+        }
+    }
+}
+
+/// Outcome of meeting-mic resolution: the device to open (`None` = system
+/// default), the name that was asked for (`None` = nothing specific), why,
+/// and whether a wanted device failed to match anything attached.
 struct MicResolution {
     device: Option<cpal::Device>,
-    pinned: Option<String>,
-    pin_missed: bool,
+    target: Option<String>,
+    source: MicSource,
+    fallback: bool,
+}
+
+/// Decrements the in-flight transcription count on drop, so a panicking
+/// processing thread can't pin `status()` at Processing forever.
+struct ProcessingGuard<'a>(&'a std::sync::atomic::AtomicU32);
+
+impl Drop for ProcessingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Truncate or zero-pad to the expected wall-clock sample count.

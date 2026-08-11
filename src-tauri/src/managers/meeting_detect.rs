@@ -120,7 +120,10 @@ pub fn spawn_meeting_detector(app_handle: &AppHandle) {
             let call_started = !current.is_empty() && previous.is_empty();
             let call_ended = current.is_empty() && !previous.is_empty();
 
-            if call_started && status == MeetingStatus::Idle {
+            // Not gated on Idle: a back-to-back call often starts while the
+            // previous meeting is still transcribing, and that was exactly
+            // when the prompt went missing (2026-08-11).
+            if call_started && status != MeetingStatus::Recording {
                 let cooled_down = last_prompt
                     .map(|t| t.elapsed() >= NOTIFY_COOLDOWN)
                     .unwrap_or(true);
@@ -213,6 +216,57 @@ fn calendar_card_fields(ctx: Option<&CalendarContext>) -> (Option<String>, Optio
         _ => None,
     };
     (ctx.title.clone(), time_range)
+}
+
+/// The microphone a meeting app on the current call is actually capturing
+/// from: the input device the call will hear, whatever the pin says.
+pub struct CallMic {
+    pub device_name: String,
+    pub app: &'static str,
+}
+
+/// Which input device is the in-progress call's meeting app using? Walks the
+/// same Core Audio process objects as detection, then asks the mic-holding
+/// process for its input-scope device list (kAudioProcessPropertyDevices) —
+/// for browsers that is the HELPER process, which the path fallback in
+/// `match_meeting_app` already covers. Virtual devices (Teams/Zoom loopbacks,
+/// Descript/Loom recorders, Lark's own tap) are skipped: recording one would
+/// capture the call's output, not Kole. Returns the first real device found.
+pub fn call_mic(own_pid: i32) -> Option<CallMic> {
+    let processes = ca::System::processes().ok()?;
+    for process in processes {
+        let Ok(pid) = process.pid() else { continue };
+        if pid == own_pid {
+            continue;
+        }
+        if !process.is_running_input().unwrap_or(false) {
+            continue;
+        }
+        let bundle_id = process.bundle_id().ok().map(|s| s.to_string());
+        let path = pid_executable_path(pid);
+        let Some(app) = match_meeting_app(bundle_id.as_deref(), path.as_deref()) else {
+            continue;
+        };
+        let devices: Vec<ca::Device> = process
+            .prop_vec(&ca::PropSelector::PROCESS_DEVICES.input_addr())
+            .unwrap_or_default();
+        for device in devices {
+            let Ok(name) = device.name() else { continue };
+            let name = name.to_string();
+            let transport = device
+                .transport_type()
+                .unwrap_or(ca::DeviceTransportType::UNKNOWN);
+            if transport == ca::DeviceTransportType::VIRTUAL {
+                log::debug!("Call mic for {app}: skipping virtual input {name:?}");
+                continue;
+            }
+            return Some(CallMic {
+                device_name: name,
+                app,
+            });
+        }
+    }
+    None
 }
 
 /// Friendly names of known meeting apps currently holding the microphone.

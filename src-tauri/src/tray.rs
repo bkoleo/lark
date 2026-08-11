@@ -261,9 +261,11 @@ pub fn update_tray_menu(app: &AppHandle, state: &TrayIconState, locale: Option<&
             .map(|m| m.status())
             .unwrap_or(MeetingStatus::Idle);
         let (label, enabled) = match status {
-            MeetingStatus::Idle => (&strings.meeting_start, true),
+            // Processing still offers Start: transcription runs on its own
+            // thread and must never block recording the next call (the
+            // "saved" card announces the old one finishing).
+            MeetingStatus::Idle | MeetingStatus::Processing => (&strings.meeting_start, true),
             MeetingStatus::Recording => (&strings.meeting_stop, true),
-            MeetingStatus::Processing => (&strings.meeting_processing, false),
         };
         MenuItem::with_id(app, "meeting_toggle", label, enabled, None::<&str>)
             .expect("failed to create meeting item")
