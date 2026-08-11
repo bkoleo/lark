@@ -650,7 +650,9 @@
     "savedTitle": "Meeting recorded successfully",
     "savedSubtitle": "Recorded — notes saved",
     "defaultMic": "Default mic",
-    "noAudio": "No audio"
+    "noAudio": "No audio",
+    "pickMic": "Choose which mic to record",
+    "autoMic": "Automatic (follow the call)"
   },
   "meetings": {
     "searchPlaceholder": "Search meetings…",

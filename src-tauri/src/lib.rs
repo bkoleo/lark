@@ -415,6 +415,8 @@ pub fn run(cli_args: CliArgs) {
             commands::cancel_operation,
             commands::meeting_prompt_action,
             commands::copy_ready_action,
+            commands::meetings::meeting_set_mic,
+            commands::meetings::meeting_picker_resize,
             commands::meetings::list_meeting_notes,
             commands::meetings::open_meeting_note,
             commands::meetings::open_meetings_folder,
@@ -541,6 +543,23 @@ pub fn run(cli_args: CliArgs) {
                         tray::update_tray_menu(&app_clone, &tray::TrayIconState::Idle, None);
                     });
                 }
+            } else if let Some(device) = args
+                .iter()
+                .position(|a| a == "--set-meeting-mic")
+                .and_then(|i| args.get(i + 1))
+                .cloned()
+            {
+                #[cfg(target_os = "macos")]
+                {
+                    let meeting_manager = app
+                        .state::<Arc<managers::meeting::MeetingManager>>()
+                        .inner()
+                        .clone();
+                    meeting_manager
+                        .set_manual_mic(if device == "auto" { None } else { Some(device) });
+                }
+                #[cfg(not(target_os = "macos"))]
+                let _ = device;
             } else if let Some(target) = args
                 .iter()
                 .position(|a| a == "--retranscribe-meeting")

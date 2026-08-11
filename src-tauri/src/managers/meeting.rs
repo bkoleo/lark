@@ -89,6 +89,13 @@ pub struct MeetingManager {
     /// In-flight transcriptions of stopped meetings. Only the tray label and
     /// the recovery CLI read it — it never gates a new recording.
     processing: std::sync::atomic::AtomicU32,
+    /// Mic picked from the recording pill — the top precedence slot
+    /// (manual → call → pin → default), so the 5s re-check never fights a
+    /// choice the user just made. Cleared when the recording ends.
+    manual_mic: Mutex<Option<String>>,
+    /// Set by `set_manual_mic` so the watchdog re-resolves on its next
+    /// 500ms tick instead of waiting out the 5s re-check interval.
+    recheck_asap: std::sync::atomic::AtomicBool,
 }
 
 impl MeetingManager {
@@ -108,7 +115,21 @@ impl MeetingManager {
             app_handle: app_handle.clone(),
             state: Mutex::new(MeetingState::Idle),
             processing: std::sync::atomic::AtomicU32::new(0),
+            manual_mic: Mutex::new(None),
+            recheck_asap: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Sets (or clears, with `None`) the mic picked from the recording
+    /// pill. Takes effect at the watchdog's next tick (≤500ms) and lasts
+    /// until the recording ends. A name that isn't attached is skipped by
+    /// resolution until it (re)appears, so an unplug falls back to
+    /// call → pin → default instead of going silent.
+    pub fn set_manual_mic(&self, device: Option<String>) {
+        log::info!("Meeting mic picked from the recording pill: {device:?}");
+        *self.manual_mic.lock().unwrap() = device;
+        self.recheck_asap
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn status(&self) -> MeetingStatus {
@@ -156,6 +177,9 @@ impl MeetingManager {
         if !matches!(*state, MeetingState::Idle) {
             return Err(anyhow!("meeting recording already active"));
         }
+        // A pill pick belongs to one recording only — a fresh one starts on
+        // automatic resolution.
+        *self.manual_mic.lock().unwrap() = None;
 
         let tap = SystemAudioTap::start()?;
 
@@ -281,7 +305,10 @@ impl MeetingManager {
                 // Runs regardless of how many silence restarts were spent:
                 // the budget caps hopeless retries of one device, never
                 // recovery onto a different one.
-                if now_ms.saturating_sub(last_target_check_ms) >= MIC_RECHECK_MS {
+                let recheck_asap = manager
+                    .recheck_asap
+                    .swap(false, std::sync::atomic::Ordering::Relaxed);
+                if recheck_asap || now_ms.saturating_sub(last_target_check_ms) >= MIC_RECHECK_MS {
                     last_target_check_ms = now_ms;
                     let resolution = manager.resolve_mic_device();
                     let current = mic.device_name();
@@ -432,7 +459,9 @@ impl MeetingManager {
         };
 
         // Recording is over — drop the indicator regardless of how the stop
-        // was triggered (card, tray, or CLI).
+        // was triggered (card, tray, or CLI), and retire the pill's mic pick
+        // with it.
+        *self.manual_mic.lock().unwrap() = None;
         crate::overlay::hide_meeting_prompt(&self.app_handle);
 
         let mut mic_samples = mic_prefix;
@@ -850,12 +879,16 @@ Transcript:\n{}",
 
     /// Where the meeting mic track should come from, in precedence order:
     ///
-    /// 1. **The call's own mic** — whatever input device the meeting app is
+    /// 1. **A mic picked on the recording pill** — the user pointing at a
+    ///    device is not a guess, so it outranks everything for the rest of
+    ///    the recording. Skipped (loudly) while unattached, picked back up
+    ///    the moment it reappears.
+    /// 2. **The call's own mic** — whatever input device the meeting app is
     ///    actually capturing from. If the call can hear Kole, so can Lark
     ///    (2026-08-10: the pin said Jabra, the call ran on another mic, and
     ///    36 minutes of his side were lost while the pill said "No audio").
-    /// 2. **The pin** (same clamshell override as dictation).
-    /// 3. **The system default.**
+    /// 3. **The pin** (same clamshell override as dictation).
+    /// 4. **The system default.**
     ///
     /// A wanted device (the call's or the pin) that can't be opened is an
     /// ERROR in the log and `fallback` in the result — opening
@@ -874,6 +907,28 @@ Transcript:\n{}",
             log::error!("Failed to list input devices: {e}");
             Vec::new()
         });
+
+        let manual = self.manual_mic.lock().unwrap().clone();
+        if let Some(name) = manual {
+            match devices.iter().position(|d| d.name == name) {
+                Some(idx) => {
+                    return MicResolution {
+                        device: devices.into_iter().nth(idx).map(|d| d.device),
+                        target: Some(name),
+                        source: MicSource::Manual,
+                        fallback: false,
+                    };
+                }
+                // The picked device was unplugged: fall through to the rest
+                // of the precedence list rather than record silence. The
+                // pick stays set, so reattaching hands the stream back.
+                None => log::error!(
+                    "Mic picked on the pill {:?} is not attached (available inputs: {:?}) — falling back to call/pin/default",
+                    name,
+                    devices.iter().map(|d| d.name.as_str()).collect::<Vec<_>>()
+                ),
+            }
+        }
 
         let own_pid = std::process::id() as i32;
         if let Some(call) = super::meeting_detect::call_mic(own_pid) {
@@ -934,6 +989,8 @@ Transcript:\n{}",
 /// transcript with a surprising track can be traced to a decision.
 #[derive(Clone, Copy)]
 enum MicSource {
+    /// A device the user picked on the recording pill.
+    Manual,
     /// The input device the call's meeting app is capturing from.
     Call(&'static str),
     /// The settings pin (or its clamshell override).
@@ -945,6 +1002,7 @@ enum MicSource {
 impl std::fmt::Display for MicSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            MicSource::Manual => write!(f, "the mic picked on the pill"),
             MicSource::Call(app) => write!(f, "the {app} call's mic"),
             MicSource::Pin => write!(f, "the pinned mic"),
             MicSource::Default => write!(f, "the system default"),

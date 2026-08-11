@@ -253,6 +253,85 @@
   font-weight: 700;
 }
 
+.meeting-mini-mic.clickable {
+  cursor: pointer;
+}
+
+.meeting-mini-mic.clickable:hover {
+  color: rgba(255, 255, 255, 0.95);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 .meeting-mini.fade-in {
   animation: card-in 180ms ease-out forwards;
+}
+
+/* Mic picker: opens under the pill when the mic name is clicked. Same dark
+   pill language; right-aligned so it stays hugged to the screen corner.
+   The window itself is resized by the backend (meeting_picker_resize) to
+   make room — rows are ~32px each to match that arithmetic. */
+.meeting-mini-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+.meeting-mic-menu {
+  margin: 0 10px 8px auto;
+  padding: 6px;
+  max-width: 236px;
+  /* The backend caps the window at 8 rows — beyond that the menu scrolls. */
+  max-height: 268px;
+  overflow-y: auto;
+  background: rgba(28, 28, 30, 0.92);
+  border-radius: 12px;
+  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.22);
+  display: flex;
+  flex-direction: column;
+  opacity: 0;
+}
+
+.meeting-mic-menu.fade-in {
+  animation: card-in 140ms ease-out forwards;
+}
+
+.meeting-mic-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  flex-shrink: 0;
+  padding: 0 10px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.85);
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  text-align: left;
+}
+
+.meeting-mic-item:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.meeting-mic-item-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.meeting-mic-item-name.auto {
+  color: rgba(255, 255, 255, 0.6);
+  font-style: italic;
+}
+
+.meeting-mic-item svg {
+  flex-shrink: 0;
 }

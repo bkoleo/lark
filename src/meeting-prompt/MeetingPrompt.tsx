@@ -32,10 +32,25 @@ interface MicStatus {
   fallback: boolean;
 }
 
+/** Attached input device, from the existing get_available_microphones
+ * command (its synthetic "default" row is filtered out — the picker's own
+ * Automatic row is the reset). */
+interface MicOption {
+  index: string;
+  name: string;
+  is_default: boolean;
+}
+
+/** Unanswered picker menus close themselves — the window grew to fit the
+ * menu, and a stray click elsewhere on screen can't reach a nonactivating
+ * panel to dismiss it. */
+const PICKER_AUTO_CLOSE_MS = 12_000;
+
 const MeetingPrompt: React.FC = () => {
   const { t } = useTranslation();
   const [mode, setMode] = useState<Mode | null>(null);
   const [micStatus, setMicStatus] = useState<MicStatus | null>(null);
+  const [micOptions, setMicOptions] = useState<MicOption[] | null>(null);
   const [, setClockTick] = useState(0);
   // Survives prompt<->recording swaps so the timer doesn't reset when the
   // card expands and collapses.
@@ -92,9 +107,54 @@ const MeetingPrompt: React.FC = () => {
       recordingStartRef.current = null;
       setMicStatus(null);
     }
+    // Any view change retires the picker menu. No resize call needed: the
+    // backend places the window for whatever it shows next.
+    setMicOptions(null);
     setMode(null);
     invoke("meeting_prompt_action", { action });
   };
+
+  const closePicker = () => {
+    setMicOptions(null);
+    invoke("meeting_picker_resize", { rows: 0 }).catch((e) =>
+      console.error("meeting_picker_resize failed", e),
+    );
+  };
+
+  const openPicker = async () => {
+    try {
+      const devices = (await invoke("get_available_microphones")) as
+        | MicOption[]
+        | null;
+      // Drop the command's synthetic "default" row; the Automatic row below
+      // is the picker's reset.
+      const options = (devices ?? []).filter((d) => d.index !== "default");
+      await invoke("meeting_picker_resize", {
+        rows: Math.min(options.length + 1, 8),
+      });
+      setMicOptions(options);
+    } catch (e) {
+      console.error("mic picker failed to open", e);
+    }
+  };
+
+  // Raw invoke, not bindings.ts — bindings only regenerate in debug builds,
+  // so a typed binding for a new command never reaches a release build.
+  // Empty device = clear the pick, back to automatic resolution.
+  const pickMic = (device: string) => {
+    invoke("meeting_set_mic", { device }).catch((e) =>
+      console.error("meeting_set_mic failed", e),
+    );
+    closePicker();
+  };
+
+  // A menu nobody touches closes itself; clicks outside a nonactivating
+  // panel never reach us, so there is no blur to listen for.
+  useEffect(() => {
+    if (!micOptions) return;
+    const timer = setTimeout(closePicker, PICKER_AUTO_CLOSE_MS);
+    return () => clearTimeout(timer);
+  }, [micOptions]);
 
   if (!mode) return null;
 
@@ -121,19 +181,57 @@ const MeetingPrompt: React.FC = () => {
           : ""
       : "";
     return (
-      <button
-        className="meeting-mini fade-in"
-        onClick={() => answer("expand_stop")}
-        aria-label={t("meetingPrompt.recording")}
-      >
-        <span className="meeting-mini-dot" />
-        <span className="meeting-mini-time">
-          {mm}:{ss}
-        </span>
-        {micLabel && (
-          <span className={`meeting-mini-mic${micClass}`}>{micLabel}</span>
+      <div className="meeting-mini-wrap">
+        <button
+          className="meeting-mini fade-in"
+          onClick={() => answer("expand_stop")}
+          aria-label={t("meetingPrompt.recording")}
+        >
+          <span className="meeting-mini-dot" />
+          <span className="meeting-mini-time">
+            {mm}:{ss}
+          </span>
+          {micLabel && (
+            <span
+              className={`meeting-mini-mic${micClass} clickable`}
+              title={t("meetingPrompt.pickMic")}
+              onClick={(e) => {
+                // The pill button expands to the Stop card; the mic name is
+                // its own target — it opens the device picker instead.
+                e.stopPropagation();
+                if (micOptions) {
+                  closePicker();
+                } else {
+                  void openPicker();
+                }
+              }}
+            >
+              {micLabel}
+            </span>
+          )}
+        </button>
+        {micOptions && (
+          <div className="meeting-mic-menu fade-in">
+            <button className="meeting-mic-item" onClick={() => pickMic("")}>
+              <span className="meeting-mic-item-name auto">
+                {t("meetingPrompt.autoMic")}
+              </span>
+            </button>
+            {micOptions.map((d) => (
+              <button
+                key={d.index}
+                className="meeting-mic-item"
+                onClick={() => pickMic(d.name)}
+              >
+                <span className="meeting-mic-item-name">{d.name}</span>
+                {micStatus?.mic === d.name && (
+                  <CheckIcon width={11} height={11} color="#34c759" />
+                )}
+              </button>
+            ))}
+          </div>
         )}
-      </button>
+      </div>
     );
   }
 

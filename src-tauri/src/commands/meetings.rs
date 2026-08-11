@@ -83,3 +83,44 @@ pub fn open_meetings_folder(app: AppHandle) -> Result<(), String> {
         .open_path(dir.to_string_lossy().to_string(), None::<String>)
         .map_err(|e| e.to_string())
 }
+
+/// Applies a mic choice made on the recording pill's picker. The picked
+/// device takes the top precedence slot (manual → call → pin → default)
+/// for the rest of the recording; an empty name clears it back to
+/// automatic. The switch itself happens on the watchdog's next tick.
+#[tauri::command]
+#[specta::specta]
+pub fn meeting_set_mic(app: AppHandle, device: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        use tauri::Manager;
+        let manager = app
+            .state::<std::sync::Arc<crate::managers::meeting::MeetingManager>>()
+            .inner()
+            .clone();
+        manager.set_manual_mic(if device.is_empty() { None } else { Some(device) });
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, device);
+        Err("meeting mode is macOS-only".to_string())
+    }
+}
+
+/// Grows the recording-indicator window so the pill's mic picker fits
+/// (`rows` menu rows), or collapses it back with `rows: 0`.
+#[tauri::command]
+#[specta::specta]
+pub fn meeting_picker_resize(app: AppHandle, rows: u32) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::overlay::resize_meeting_indicator(&app, rows);
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, rows);
+        Err("meeting mode is macOS-only".to_string())
+    }
+}

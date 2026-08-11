@@ -27,6 +27,12 @@ pub struct CliArgs {
     #[arg(long)]
     pub toggle_meeting: bool,
 
+    /// Pick the mic for the running meeting recording by device name, same
+    /// as choosing it on the recording pill; "auto" clears the pick (sent
+    /// to running instance, macOS only)
+    #[arg(long, value_name = "DEVICE")]
+    pub set_meeting_mic: Option<String>,
+
     /// Re-transcribe a saved meeting from its WAV tracks, overwriting the
     /// transcript. Takes either track or the .md (sent to running instance,
     /// macOS only)

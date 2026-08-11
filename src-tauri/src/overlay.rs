@@ -560,6 +560,21 @@ pub fn show_meeting_recording_indicator(app_handle: &AppHandle) {
     }
 }
 
+/// Grows the recording-indicator window downward so the pill's mic-picker
+/// menu fits (`rows` menu rows at ~32px each), or collapses it back to the
+/// bare pill with `rows: 0`. Width is untouched, so the top-right anchor
+/// holds without repositioning.
+#[cfg(target_os = "macos")]
+pub fn resize_meeting_indicator(app_handle: &AppHandle, rows: u32) {
+    let rows = rows.min(8) as f64;
+    let height = if rows == 0.0 {
+        MEETING_MINI_HEIGHT
+    } else {
+        MEETING_MINI_HEIGHT + rows * 32.0 + 24.0
+    };
+    place_meeting_window(app_handle, MEETING_MINI_WIDTH, height);
+}
+
 /// Tells the recording indicator which mic is being recorded and whether it
 /// is delivering audio. `fallback` marks a system-default stream opened
 /// because the pinned mic wasn't attached — the pill renders the name in a
