@@ -15,10 +15,12 @@ pub fn cancel_operation(app: AppHandle) {
     cancel_current_operation(&app);
 }
 
-/// Handles a click on the meeting card / recording indicator.
-/// "record"/"stop" toggle the meeting recording; "expand_stop" swaps the
-/// mini indicator for the card with a Stop button; "dismiss" collapses
-/// back to the indicator while recording, otherwise hides.
+/// Handles a click on the meeting card / mini indicator.
+/// "record"/"stop" toggle the meeting recording; "expand_stop" and
+/// "expand_record" swap the mini indicator for the matching card;
+/// "collapse" is an unanswered card timing out, which drops back to
+/// whichever pill applies; "dismiss" is the user actively saying no, which
+/// also throws away any rewind buffer for this call.
 #[tauri::command]
 #[specta::specta]
 pub fn meeting_prompt_action(app: AppHandle, action: String) -> Result<(), String> {
@@ -47,13 +49,48 @@ pub fn meeting_prompt_action(app: AppHandle, action: String) -> Result<(), Strin
             }
             "expand_stop" => {
                 let title = meeting_manager.recording_calendar_title();
-                crate::overlay::show_meeting_prompt(&app, "stop_ask", "", title.as_deref(), None);
+                crate::overlay::show_meeting_prompt(
+                    &app,
+                    "stop_ask",
+                    "",
+                    title.as_deref(),
+                    None,
+                    None,
+                );
+            }
+            "expand_record" => {
+                crate::overlay::show_meeting_prompt(
+                    &app,
+                    "start",
+                    "",
+                    None,
+                    None,
+                    meeting_manager
+                        .standby_rewind()
+                        .map(|(buffered, _)| buffered),
+                );
+            }
+            "collapse" => {
+                // A card nobody answered. Timing out is not a "no": while a
+                // call is still being buffered the Record button goes back
+                // to the pill and waits there, which is the entire point of
+                // the rewind — the user who missed this card is exactly the
+                // one it was built for.
+                if meeting_manager.status() == MeetingStatus::Recording {
+                    crate::overlay::show_meeting_recording_indicator(&app);
+                } else if let Some((buffered, cap)) = meeting_manager.standby_rewind() {
+                    crate::overlay::show_meeting_ready_indicator(&app, buffered, cap);
+                } else {
+                    crate::overlay::hide_meeting_prompt(&app);
+                }
             }
             _ => {
-                // dismiss
+                // dismiss — an explicit no, unlike a timeout. Stop buffering
+                // this call and take the pill off screen with it.
                 if meeting_manager.status() == MeetingStatus::Recording {
                     crate::overlay::show_meeting_recording_indicator(&app);
                 } else {
+                    meeting_manager.stop_standby("dismissed by the user");
                     crate::overlay::hide_meeting_prompt(&app);
                 }
             }

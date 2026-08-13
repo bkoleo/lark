@@ -39,6 +39,12 @@ pub struct CliArgs {
     #[arg(long, value_name = "PATH")]
     pub retranscribe_meeting: Option<String>,
 
+    /// How many minutes of a detected call to hold in memory so a late
+    /// Record still catches the start of it. 0 turns the rewind off (sent to
+    /// running instance, macOS only)
+    #[arg(long, value_name = "MINUTES")]
+    pub meeting_rewind: Option<u32>,
+
     /// Enable debug mode with verbose logging
     #[arg(long)]
     pub debug: bool,

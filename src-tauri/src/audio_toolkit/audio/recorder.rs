@@ -1,7 +1,7 @@
 use std::{
     io::Error,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc, Arc, Mutex,
     },
     time::Duration,
@@ -22,8 +22,20 @@ use crate::audio_toolkit::{
 enum Cmd {
     Start,
     Stop(mpsc::Sender<Vec<f32>>),
+    /// Hand over everything captured so far and keep the stream running —
+    /// how a rolling pre-roll buffer becomes the head of a real recording
+    /// without a teardown (see `MeetingManager::promote_standby`). Unlike
+    /// `Stop` it never raises the stop flag, so no audio is dropped waiting
+    /// for the callback to acknowledge one.
+    Take(mpsc::Sender<Vec<f32>>),
     Shutdown,
 }
+
+/// How far past the cap the rolling buffer is allowed to grow before it is
+/// trimmed back. Trimming is a memmove of the whole buffer, so doing it once
+/// per this much audio (rather than per 30ms chunk) keeps the cost invisible
+/// while bounding the overshoot to something that never matters.
+const CAP_SLACK_SAMPLES: usize = constants::WHISPER_SAMPLE_RATE as usize * 30;
 
 enum AudioChunk {
     Samples(Vec<f32>),
@@ -37,6 +49,12 @@ pub struct AudioRecorder {
     vad: Option<Arc<Mutex<Box<dyn vad::VoiceActivityDetector>>>>,
     level_cb: Option<Arc<dyn Fn(Vec<f32>) + Send + Sync + 'static>>,
     flow_cb: Option<Arc<dyn Fn(f32) + Send + Sync + 'static>>,
+    /// Rolling-buffer ceiling in samples. `usize::MAX` (the default, and
+    /// what dictation and a live meeting recording both use) means keep
+    /// everything; anything smaller discards the oldest audio and retains
+    /// only the most recent window. Shared with the consumer thread so it
+    /// can be changed while the stream is running.
+    sample_cap: Arc<AtomicUsize>,
 }
 
 impl AudioRecorder {
@@ -48,7 +66,40 @@ impl AudioRecorder {
             vad: None,
             level_cb: None,
             flow_cb: None,
+            sample_cap: Arc::new(AtomicUsize::new(usize::MAX)),
         })
+    }
+
+    /// Caps the buffer to the most recent `samples`, or removes the cap with
+    /// `None`. Takes effect on the next chunk, so it is safe to call on a
+    /// running stream — which is the point: standby capture runs capped and
+    /// is uncapped in place the moment the user hits Record.
+    pub fn set_sample_cap(&self, samples: Option<usize>) {
+        self.sample_cap
+            .store(samples.unwrap_or(usize::MAX), Ordering::Relaxed);
+    }
+
+    /// Takes the captured audio without interrupting capture. Returns empty
+    /// if the stream is delivering nothing — a dead mic must not be able to
+    /// block the caller (the recording this hands off to still has to start).
+    pub fn take_buffer(&self) -> Vec<f32> {
+        let (resp_tx, resp_rx) = mpsc::channel();
+        let Some(tx) = &self.cmd_tx else {
+            return Vec::new();
+        };
+        if tx.send(Cmd::Take(resp_tx)).is_err() {
+            return Vec::new();
+        }
+        // The consumer only reads commands between chunks (~30ms). A second
+        // is many chunks; missing that means no audio is arriving at all.
+        resp_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap_or_else(|_| {
+                log::warn!(
+                    "Timed out taking the audio buffer — no chunks arriving from the device"
+                );
+                Vec::new()
+            })
     }
 
     pub fn with_vad(mut self, vad: Box<dyn VoiceActivityDetector>) -> Self {
@@ -102,6 +153,7 @@ impl AudioRecorder {
         // Move the optional callbacks into the worker thread
         let level_cb = self.level_cb.clone();
         let flow_cb = self.flow_cb.clone();
+        let sample_cap = self.sample_cap.clone();
 
         let worker = std::thread::spawn(move || {
             let stop_flag = Arc::new(AtomicBool::new(false));
@@ -186,6 +238,7 @@ impl AudioRecorder {
                         level_cb,
                         flow_cb,
                         stop_flag,
+                        sample_cap,
                     );
                     drop(stream);
                 }
@@ -234,7 +287,27 @@ impl AudioRecorder {
         if let Some(tx) = &self.cmd_tx {
             tx.send(Cmd::Stop(resp_tx))?;
         }
-        Ok(resp_rx.recv()?) // wait for the samples
+        // Wait for the samples — but never forever. The consumer only reads
+        // commands between chunks, so a device that has stopped delivering
+        // them entirely (a USB mic pulled off the bus mid-take) leaves this
+        // waiting on a reply that can no longer come. Unbounded, that hangs
+        // whatever holds the meeting state lock and takes the app's tray and
+        // status with it. Ten seconds is far past any real stop — the
+        // internal drain gives up on a dead callback after two — so this
+        // fires only in the hung case, and turns an app-wide freeze into one
+        // lost track with a line in the log saying so.
+        resp_rx
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|_| {
+                log::error!(
+                    "Audio stream stopped delivering audio and never returned its samples — the device was most likely disconnected mid-recording"
+                );
+                Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the audio device stopped responding",
+                )
+                .into()
+            })
     }
 
     pub fn close(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -419,6 +492,9 @@ mod tests {
     }
 }
 
+// One private consumer wired to one stream: the argument list is the wiring,
+// and bundling it into a struct would only move the same fields elsewhere.
+#[allow(clippy::too_many_arguments)]
 fn run_consumer(
     in_sample_rate: u32,
     vad: Option<Arc<Mutex<Box<dyn vad::VoiceActivityDetector>>>>,
@@ -427,6 +503,7 @@ fn run_consumer(
     level_cb: Option<Arc<dyn Fn(Vec<f32>) + Send + Sync + 'static>>,
     flow_cb: Option<Arc<dyn Fn(f32) + Send + Sync + 'static>>,
     stop_flag: Arc<AtomicBool>,
+    sample_cap: Arc<AtomicUsize>,
 ) {
     let mut frame_resampler = FrameResampler::new(
         in_sample_rate as usize,
@@ -500,6 +577,28 @@ fn run_consumer(
             handle_frame(frame, recording, &vad, &mut processed_samples)
         });
 
+        // ---------- rolling-buffer trim ----------------------------------- //
+        // Only ever active for standby capture; a normal recording runs
+        // uncapped and never enters this branch.
+        let cap = sample_cap.load(Ordering::Relaxed);
+        if cap != usize::MAX {
+            let ceiling = cap.saturating_add(CAP_SLACK_SAMPLES);
+            // Claim the window in one go. `drain` frees length, never
+            // capacity, so a buffer left to grow into its cap settles at
+            // whatever power-of-two the doubling landed on — measured at
+            // ~2.5x the audio it holds, which on a ten-minute buffer is
+            // ~50 MB of headroom nobody asked for, on a machine that has
+            // OOM-killed a transcription before. Reserved pages cost nothing
+            // until they are written to.
+            if processed_samples.capacity() < ceiling && processed_samples.len() < ceiling {
+                processed_samples.reserve_exact(ceiling - processed_samples.len());
+            }
+            if processed_samples.len() > ceiling {
+                let excess = processed_samples.len() - cap;
+                processed_samples.drain(..excess);
+            }
+        }
+
         // non-blocking check for a command
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
@@ -544,6 +643,12 @@ fn run_consumer(
                     // Resume the audio callback so the consumer loop can continue
                     // receiving chunks (important for always-on microphone mode).
                     stop_flag.store(false, Ordering::Relaxed);
+                }
+                Cmd::Take(reply_tx) => {
+                    // Hand the buffer over and carry straight on recording
+                    // into a fresh one. No stop flag, no drain: the caller is
+                    // promoting a rolling buffer, not ending a take.
+                    let _ = reply_tx.send(std::mem::take(&mut processed_samples));
                 }
                 Cmd::Shutdown => {
                     stop_flag.store(true, Ordering::Relaxed);

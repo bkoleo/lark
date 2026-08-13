@@ -12,7 +12,8 @@
 //! key (the first capture triggers a one-time "record system audio"
 //! permission prompt).
 
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -25,6 +26,10 @@ use cidre::{av, cat, cf, core_audio as ca, ns, os};
 
 const TAP_DEVICE_NAME: &str = "lark-audio-tap";
 
+/// Trim the rolling buffer back to the cap only once per this much overshoot
+/// — see the matching constant in `recorder.rs`.
+const CAP_SLACK_SAMPLES: usize = constants::WHISPER_SAMPLE_RATE as usize * 30;
+
 struct Ctx {
     common_format: av::audio::CommonFormat,
     tx: mpsc::Sender<Vec<f32>>,
@@ -35,7 +40,13 @@ pub struct SystemAudioTap {
     device: Option<ca::hardware::StartedDevice<ca::AggregateDevice>>,
     // Box gives the IO proc a stable pointer; must outlive `device`.
     ctx: Option<Box<Ctx>>,
-    consumer: Option<std::thread::JoinHandle<Vec<f32>>>,
+    consumer: Option<std::thread::JoinHandle<()>>,
+    /// Shared with the consumer thread so the buffer can be capped, read or
+    /// taken while capture continues.
+    accumulated: Arc<Mutex<Vec<f32>>>,
+    /// `usize::MAX` = keep everything (a real recording); smaller = keep only
+    /// the most recent window (standby capture waiting to be promoted).
+    sample_cap: Arc<AtomicUsize>,
 }
 
 // The tap/device guards are only touched from start()/stop(); Core Audio
@@ -136,20 +147,40 @@ impl SystemAudioTap {
 
         // Consumer: resample native-rate chunks to 16 kHz mono and accumulate.
         // Runs until every sender (the Ctx) is dropped in stop().
+        let accumulated = Arc::new(Mutex::new(Vec::<f32>::new()));
+        let sample_cap = Arc::new(AtomicUsize::new(usize::MAX));
+        let sink = accumulated.clone();
+        let cap = sample_cap.clone();
         let consumer = std::thread::spawn(move || {
             let mut resampler = FrameResampler::new(
                 sample_rate as usize,
                 constants::WHISPER_SAMPLE_RATE as usize,
                 Duration::from_millis(30),
             );
-            let mut accumulated = Vec::<f32>::new();
             while let Ok(chunk) = rx.recv() {
-                resampler.push(&chunk, &mut |frame: &[f32]| {
-                    accumulated.extend_from_slice(frame)
-                });
+                let mut buf = sink.lock().unwrap();
+                resampler.push(&chunk, &mut |frame: &[f32]| buf.extend_from_slice(frame));
+                let cap = cap.load(Ordering::Relaxed);
+                if cap != usize::MAX {
+                    // Reserve the whole window up front rather than letting
+                    // the Vec double into it — see the matching comment in
+                    // `recorder.rs`; `drain` never gives capacity back.
+                    let ceiling = cap.saturating_add(CAP_SLACK_SAMPLES);
+                    // Length read out first: through the mutex guard, calling
+                    // `buf.len()` inside `buf.reserve_exact(..)` is a borrow
+                    // of `buf` while it is already mutably borrowed.
+                    let len = buf.len();
+                    if buf.capacity() < ceiling && len < ceiling {
+                        buf.reserve_exact(ceiling - len);
+                    }
+                    if buf.len() > ceiling {
+                        let excess = buf.len() - cap;
+                        buf.drain(..excess);
+                    }
+                }
             }
-            resampler.finish(&mut |frame: &[f32]| accumulated.extend_from_slice(frame));
-            accumulated
+            let mut buf = sink.lock().unwrap();
+            resampler.finish(&mut |frame: &[f32]| buf.extend_from_slice(frame));
         });
 
         Ok(Self {
@@ -157,7 +188,27 @@ impl SystemAudioTap {
             device: Some(device),
             ctx: Some(ctx),
             consumer: Some(consumer),
+            accumulated,
+            sample_cap,
         })
+    }
+
+    /// Caps the buffer to the most recent `samples`, or removes the cap with
+    /// `None`. Safe to change mid-capture.
+    pub fn set_sample_cap(&self, samples: Option<usize>) {
+        self.sample_cap
+            .store(samples.unwrap_or(usize::MAX), Ordering::Relaxed);
+    }
+
+    /// Samples captured so far, without interrupting capture.
+    pub fn buffered_len(&self) -> usize {
+        self.accumulated.lock().unwrap().len()
+    }
+
+    /// Takes the captured audio and keeps capturing into a fresh buffer —
+    /// the tap half of promoting a standby buffer into a real recording.
+    pub fn take_buffer(&self) -> Vec<f32> {
+        std::mem::take(&mut *self.accumulated.lock().unwrap())
     }
 
     /// Stops capture and returns the accumulated 16 kHz mono samples.
@@ -174,7 +225,8 @@ impl SystemAudioTap {
             .ok_or_else(|| anyhow!("system tap already stopped"))?;
         consumer
             .join()
-            .map_err(|_| anyhow!("system tap consumer thread panicked"))
+            .map_err(|_| anyhow!("system tap consumer thread panicked"))?;
+        Ok(std::mem::take(&mut *self.accumulated.lock().unwrap()))
     }
 }
 

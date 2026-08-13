@@ -208,6 +208,16 @@
   animation: mini-pulse 1.6s ease-in-out infinite;
 }
 
+/* Record-ready: the same dot, hollow and still. A call being buffered is
+   not being recorded, and the pill must not be able to be read as if it
+   were — the difference is deliberately shape, not just colour. */
+.meeting-mini-dot.ready {
+  box-sizing: border-box;
+  background: transparent;
+  border: 2px solid #e8a33d;
+  animation: none;
+}
+
 @keyframes mini-pulse {
   0%,
   100% {
@@ -242,6 +252,13 @@
   padding-left: 7px;
   font-family:
     -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+/* The Record-ready pill spends a word on "Record", so the mic name gets a
+   tighter ceiling — the window is a fixed 260px and the pill is hugged to
+   the screen edge, so anything wider clips off the left rather than wrapping. */
+.meeting-mini.ready .meeting-mini-mic {
+  max-width: 110px;
 }
 
 .meeting-mini-mic.warn {

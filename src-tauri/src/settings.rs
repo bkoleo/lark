@@ -421,6 +421,16 @@ pub struct AppSettings {
     /// sandbox mounts only that folder.
     #[serde(default = "default_meetings_folder")]
     pub meetings_folder: String,
+    /// How many minutes of a detected call Lark holds in memory before you
+    /// press Record, so hitting Record late still captures the part you
+    /// missed. 0 turns the rewind off entirely and Record starts from now.
+    ///
+    /// Costs roughly 8 MB of RAM per minute (two 16 kHz f32 tracks) for as
+    /// long as a call is detected, and nothing at all otherwise — capture
+    /// only runs while a meeting app holds the microphone, and the buffer is
+    /// discarded when the call ends unless it was promoted to a recording.
+    #[serde(default = "default_meeting_prerecord_minutes")]
+    pub meeting_prerecord_minutes: u32,
     #[serde(default)]
     pub mute_while_recording: bool,
     #[serde(default)]
@@ -557,6 +567,13 @@ fn default_post_process_provider_id() -> String {
 /// than refused: a partial summary beats none, and the cap is a spend guard.
 fn default_meeting_notes_max_chars() -> usize {
     80_000
+}
+
+/// Ten minutes of rewind, ~80 MB of RAM while a call is on screen. Long
+/// enough to cover "we started, and five minutes in I realised", short
+/// enough to stay unnoticeable on an 8 GB machine.
+fn default_meeting_prerecord_minutes() -> u32 {
+    10
 }
 
 /// `~/Documents/Claude/Meetings` — inside the Cowork mount on purpose.
@@ -859,6 +876,7 @@ pub fn get_default_settings() -> AppSettings {
         meeting_notes_enabled: false,
         meeting_notes_max_chars: default_meeting_notes_max_chars(),
         meetings_folder: default_meetings_folder(),
+        meeting_prerecord_minutes: default_meeting_prerecord_minutes(),
         mute_while_recording: false,
         append_trailing_space: false,
         app_language: default_app_language(),

@@ -646,13 +646,15 @@
     "dismiss": "Dismiss",
     "recording": "Recording meeting",
     "recordSubtitle": "this meeting",
+    "recordRewind": "incl. last {{time}}",
     "stopSubtitle": "recording",
     "savedTitle": "Meeting recorded successfully",
     "savedSubtitle": "Recorded — notes saved",
     "defaultMic": "Default mic",
     "noAudio": "No audio",
     "pickMic": "Choose which mic to record",
-    "autoMic": "Automatic (follow the call)"
+    "autoMic": "Automatic (follow the call)",
+    "readyAria": "Record this call"
   },
   "meetings": {
     "searchPlaceholder": "Search meetings…",

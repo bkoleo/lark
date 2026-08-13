@@ -124,11 +124,19 @@ pub fn spawn_meeting_detector(app_handle: &AppHandle) {
             // previous meeting is still transcribing, and that was exactly
             // when the prompt went missing (2026-08-11).
             if call_started && status != MeetingStatus::Recording {
+                log::info!("Meeting detected: {} is using the mic", current[0]);
+                // Buffer from here whether or not the card is shown: the
+                // rewind follows the call, not the prompt. Suppressed by the
+                // cooldown it would be a buffer nobody could reach, and
+                // gated on the user noticing the card it would be no use to
+                // the user who didn't.
+                if let Some(manager) = app.try_state::<Arc<MeetingManager>>() {
+                    manager.inner().clone().start_standby(current[0]);
+                }
                 let cooled_down = last_prompt
                     .map(|t| t.elapsed() >= NOTIFY_COOLDOWN)
                     .unwrap_or(true);
                 if cooled_down {
-                    log::info!("Meeting detected: {} is using the mic", current[0]);
                     // Read-only EventKit lookup, same call `MeetingManager::start()`
                     // makes when the user actually clicks Record — local (no
                     // network), so no perceptible delay before the card pops.
@@ -142,8 +150,19 @@ pub fn spawn_meeting_detector(app_handle: &AppHandle) {
                         current[0],
                         title.as_deref(),
                         time_range.as_deref(),
+                        None,
                     );
                     last_prompt = Some(Instant::now());
+                }
+            }
+
+            // The call is over and nobody pressed Record: the buffer was
+            // never anything but a possibility, so it goes. Held any longer
+            // it would be memory kept for a meeting that has finished, and
+            // the next call's buffer starts clean.
+            if call_ended && status != MeetingStatus::Recording {
+                if let Some(manager) = app.try_state::<Arc<MeetingManager>>() {
+                    manager.inner().clone().stop_standby("the call ended");
                 }
             }
 
@@ -165,6 +184,7 @@ pub fn spawn_meeting_detector(app_handle: &AppHandle) {
                     "stop",
                     previous[0],
                     title.as_deref(),
+                    None,
                     None,
                 );
                 call_end_grace = Some(Instant::now());

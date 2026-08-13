@@ -45,6 +45,10 @@ const MAX_MIC_RESTARTS: u32 = 3;
 /// appearing or changing, or a late-attached pin — and switch the moment
 /// the answer differs from the open device.
 const MIC_RECHECK_MS: u64 = 5_000;
+/// Ceiling on the rewind buffer whatever the setting says. Thirty minutes is
+/// ~240 MB of RAM across the two tracks, which is as far as an 8 GB machine
+/// should be asked to go for audio nobody has asked to keep yet.
+const MAX_PRERECORD_MINUTES: u32 = 30;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum MeetingStatus {
@@ -62,11 +66,31 @@ pub enum MeetingStatus {
 enum MeetingState {
     Idle,
     Recording {
+        /// True while this is *standby* capture: both tracks are running and
+        /// capped to the last few minutes, and everything older is thrown
+        /// away. Nothing is written and `status()` still answers Idle — the
+        /// user has not asked for a recording. Pressing Record promotes the
+        /// buffer in place (`promote_standby`) rather than starting a fresh
+        /// capture, which is how a late Record still catches the beginning
+        /// of the call.
+        standby: bool,
         mic: AudioRecorder,
         /// Samples salvaged across mic restarts, wall-clock normalised.
         mic_prefix: Vec<f32>,
-        mic_started: Instant,
-        /// ms since mic_started of the last chunk with real signal.
+        /// System audio captured before Record was pressed. Empty unless a
+        /// standby buffer was promoted; the tap itself keeps running, so
+        /// this is only the part that predates the recording.
+        sys_prefix: Vec<f32>,
+        /// When the streams were opened. Everything measured in relative
+        /// terms — the flow watchdog, restart bookkeeping, the depth of the
+        /// rewind buffer — counts from here.
+        capture_started: Instant,
+        /// Where the audio being kept begins: the same as `capture_started`
+        /// for an ordinary recording, and backdated by the length of the
+        /// pre-roll when a standby buffer was promoted. Every comparison of
+        /// a track's length against wall-clock uses this one.
+        audio_started: Instant,
+        /// ms since capture_started of the last chunk with real signal.
         flow_last_ms: Arc<AtomicU64>,
         last_restart_ms: u64,
         restarts: u32,
@@ -79,6 +103,9 @@ enum MeetingState {
         /// Filled in on a background thread — the first-ever lookup can sit on
         /// a permission dialog for as long as the user takes to answer it, and
         /// nothing about starting a recording may wait for that.
+        /// Resolved when the *recording* starts, never during standby: the
+        /// answer to "what is on now" belongs to the moment the user
+        /// committed, and an unpromoted buffer has no meeting to name.
         calendar: Arc<Mutex<Option<CalendarContext>>>,
     },
 }
@@ -132,10 +159,15 @@ impl MeetingManager {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Standby deliberately reports `Idle`: nothing has been asked for, and
+    /// every existing caller — the tray label, the detection card, the CLI,
+    /// the recovery gate — should behave exactly as it does when no buffer
+    /// is running. The buffer only ever changes what pressing Record
+    /// *contains*, never whether it is offered.
     pub fn status(&self) -> MeetingStatus {
         match *self.state.lock().unwrap() {
-            MeetingState::Recording { .. } => MeetingStatus::Recording,
-            MeetingState::Idle => {
+            MeetingState::Recording { standby: false, .. } => MeetingStatus::Recording,
+            MeetingState::Recording { .. } | MeetingState::Idle => {
                 if self.processing.load(Ordering::Relaxed) > 0 {
                     MeetingStatus::Processing
                 } else {
@@ -143,6 +175,42 @@ impl MeetingManager {
                 }
             }
         }
+    }
+
+    /// How much audio a live recording already holds, in seconds — which for
+    /// a recording promoted from a rewind buffer starts well above zero. The
+    /// pill's clock is seeded from this so it reads as what the recording
+    /// *contains*; starting it at 00:00 after a rewind would say, in the one
+    /// place the user is looking, that the earlier part was not caught.
+    pub fn recording_elapsed_secs(&self) -> Option<u64> {
+        let state = self.state.lock().unwrap();
+        let MeetingState::Recording {
+            standby: false,
+            audio_started,
+            ..
+        } = &*state
+        else {
+            return None;
+        };
+        Some(audio_started.elapsed().as_secs())
+    }
+
+    /// How far back Record can currently reach, and the window it is filling
+    /// towards, in seconds — or `None` when no standby capture is running.
+    /// The first number stops climbing once the window is full: it answers
+    /// "how much of this call would I get", not "how long has it been going".
+    pub fn standby_rewind(&self) -> Option<(u64, u64)> {
+        let state = self.state.lock().unwrap();
+        let MeetingState::Recording {
+            standby: true,
+            capture_started,
+            ..
+        } = &*state
+        else {
+            return None;
+        };
+        let cap = prerecord_secs(&self.app_handle);
+        Some((capture_started.elapsed().as_secs().min(cap), cap))
     }
 
     /// The calendar event title matched at `start()`, if a recording is
@@ -172,25 +240,24 @@ impl MeetingManager {
         }
     }
 
-    fn start(self: &Arc<Self>) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
-        if !matches!(*state, MeetingState::Idle) {
-            return Err(anyhow!("meeting recording already active"));
-        }
-        // A pill pick belongs to one recording only — a fresh one starts on
-        // automatic resolution.
-        *self.manual_mic.lock().unwrap() = None;
-
+    /// Opens both tracks — mic (resolved through manual → call → pin →
+    /// default) and the system tap — and returns them started. Shared by an
+    /// ordinary recording and by standby capture, which differ only in
+    /// whether the buffers are capped and whether anything is kept.
+    fn open_capture(&self) -> Result<OpenCapture> {
         let tap = SystemAudioTap::start()?;
 
-        let mic_started = Instant::now();
+        let capture_started = Instant::now();
         let flow_last_ms = Arc::new(AtomicU64::new(0));
         let flow_clone = flow_last_ms.clone();
         let mut mic = AudioRecorder::new()
             .map_err(|e| anyhow!("{e}"))?
             .with_flow_callback(move |rms| {
                 if rms > FLOW_RMS_THRESHOLD {
-                    flow_clone.store(mic_started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    flow_clone.store(
+                        capture_started.elapsed().as_millis() as u64,
+                        Ordering::Relaxed,
+                    );
                 }
             });
         let resolution = self.resolve_mic_device();
@@ -203,33 +270,60 @@ impl MeetingManager {
         }
         mic.start().map_err(|e| anyhow!("{e}"))?;
 
+        let mic_name = mic.device_name().unwrap_or_else(|| "default".into());
+        Ok(OpenCapture {
+            mic,
+            tap,
+            capture_started,
+            flow_last_ms,
+            fallback,
+            mic_name,
+            source: source.to_string(),
+        })
+    }
+
+    fn start(self: &Arc<Self>) -> Result<()> {
+        // A live rewind buffer becomes the head of this recording instead of
+        // being thrown away. This is the whole feature: the click is late,
+        // the recording is not.
+        if self.promote_standby() {
+            return Ok(());
+        }
+
+        let mut state = self.state.lock().unwrap();
+        if !matches!(*state, MeetingState::Idle) {
+            return Err(anyhow!("meeting recording already active"));
+        }
+        // A pill pick belongs to one recording only — a fresh one starts on
+        // automatic resolution.
+        *self.manual_mic.lock().unwrap() = None;
+
+        let capture = self.open_capture()?;
+
         // The model is NOT pre-loaded here: holding 640MB through a whole
         // call would hurt on 8GB. process() loads it after the recording.
 
-        let mic_name = mic.device_name().unwrap_or_else(|| "default".into());
-        log::info!("Meeting recording started (mic: {mic_name}, via {source})");
-        // Resolve the calendar event off-thread; process() reads it ~an hour
-        // later, so there is no race worth guarding beyond the mutex.
-        let calendar = Arc::new(Mutex::new(None));
-        let calendar_sink = calendar.clone();
-        std::thread::spawn(move || {
-            if let Some(ctx) = meeting_calendar::current_event() {
-                log::info!("Meeting matched calendar event: {:?}", ctx.title);
-                *calendar_sink.lock().unwrap() = Some(ctx);
-            }
-        });
+        let mic_name = capture.mic_name.clone();
+        let fallback = capture.fallback;
+        log::info!(
+            "Meeting recording started (mic: {mic_name}, via {})",
+            capture.source
+        );
 
         *state = MeetingState::Recording {
-            mic,
+            standby: false,
+            mic: capture.mic,
             mic_prefix: Vec::new(),
-            mic_started,
-            flow_last_ms,
+            sys_prefix: Vec::new(),
+            capture_started: capture.capture_started,
+            audio_started: capture.capture_started,
+            flow_last_ms: capture.flow_last_ms,
             last_restart_ms: 0,
             restarts: 0,
             fallback,
-            tap,
+            tap: capture.tap,
             started: Local::now(),
-            calendar,
+            calendar: self.spawn_calendar_lookup(),
         };
         drop(state);
 
@@ -240,6 +334,208 @@ impl MeetingManager {
         crate::overlay::show_meeting_recording_indicator(&self.app_handle);
         crate::overlay::emit_meeting_mic_status(&self.app_handle, Some(&mic_name), true, fallback);
         Ok(())
+    }
+
+    /// Resolves the calendar event off-thread: the first-ever lookup can sit
+    /// on a permission dialog for as long as the user takes to answer it, and
+    /// nothing about starting a recording may wait for that. `process()`
+    /// reads the result an hour later, so the mutex is guard enough.
+    fn spawn_calendar_lookup(&self) -> Arc<Mutex<Option<CalendarContext>>> {
+        let calendar = Arc::new(Mutex::new(None));
+        let calendar_sink = calendar.clone();
+        std::thread::spawn(move || {
+            if let Some(ctx) = meeting_calendar::current_event() {
+                log::info!("Meeting matched calendar event: {:?}", ctx.title);
+                *calendar_sink.lock().unwrap() = Some(ctx);
+            }
+        });
+        calendar
+    }
+
+    /// Starts capping-and-discarding capture of a detected call so that a
+    /// later Record can reach back into it. Does nothing when the rewind is
+    /// switched off, when anything is already capturing, or when the tap or
+    /// mic won't open — a failed buffer must never cost the user the
+    /// ordinary "start from now" recording that the card still offers.
+    pub fn start_standby(self: &Arc<Self>, app: &str) {
+        let cap_secs = prerecord_secs(&self.app_handle);
+        if cap_secs == 0 {
+            return;
+        }
+        {
+            let state = self.state.lock().unwrap();
+            if !matches!(*state, MeetingState::Idle) {
+                return;
+            }
+        }
+
+        let capture = match self.open_capture() {
+            Ok(capture) => capture,
+            Err(e) => {
+                log::warn!("Rewind buffer for the {app} call could not start: {e}");
+                return;
+            }
+        };
+        let cap_samples = (cap_secs as usize) * SAMPLE_RATE;
+        capture.mic.set_sample_cap(Some(cap_samples));
+        capture.tap.set_sample_cap(Some(cap_samples));
+
+        let mic_name = capture.mic_name.clone();
+        let fallback = capture.fallback;
+        log::info!(
+            "Rewind buffer started for the {app} call: holding the last {} min (mic: {mic_name}, via {})",
+            cap_secs / 60,
+            capture.source
+        );
+
+        {
+            let mut state = self.state.lock().unwrap();
+            // Re-checked under the lock: a recording could have started
+            // while the tap was being created.
+            if !matches!(*state, MeetingState::Idle) {
+                drop(state);
+                let _ = capture.tap.stop();
+                let mut mic = capture.mic;
+                let _ = mic.stop();
+                let _ = mic.close();
+                return;
+            }
+            *state = MeetingState::Recording {
+                standby: true,
+                mic: capture.mic,
+                mic_prefix: Vec::new(),
+                sys_prefix: Vec::new(),
+                capture_started: capture.capture_started,
+                audio_started: capture.capture_started,
+                flow_last_ms: capture.flow_last_ms,
+                last_restart_ms: 0,
+                restarts: 0,
+                fallback,
+                tap: capture.tap,
+                started: Local::now(),
+                calendar: Arc::new(Mutex::new(None)),
+            };
+        }
+
+        // The same watchdog a recording gets: a silent mic is restarted and
+        // the call's own mic is followed, so the buffer is worth promoting
+        // when the moment comes.
+        self.spawn_mic_watchdog();
+        crate::overlay::show_meeting_ready_indicator(&self.app_handle, 0, cap_secs);
+        crate::overlay::emit_meeting_mic_status(&self.app_handle, Some(&mic_name), true, fallback);
+    }
+
+    /// Turns a standby buffer into a real recording without touching either
+    /// stream: the caps come off, what was buffered becomes the head of the
+    /// take, and the clock is wound back so the transcript's timestamps
+    /// start where the audio does. Returns false if there was no buffer.
+    fn promote_standby(self: &Arc<Self>) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let MeetingState::Recording {
+            standby,
+            mic,
+            mic_prefix,
+            sys_prefix,
+            capture_started,
+            audio_started,
+            flow_last_ms,
+            last_restart_ms,
+            started,
+            calendar,
+            fallback,
+            tap,
+            ..
+        } = &mut *state
+        else {
+            return false;
+        };
+        if !*standby {
+            return false;
+        }
+
+        // Wall-clock is the authority on how much to keep, not either
+        // track's length: a mic restarted mid-buffer holds less audio than
+        // the tap, and taking the shorter of the two would throw away the
+        // far side of the call as well.
+        let keep_secs =
+            (capture_started.elapsed().as_secs_f64()).min(prerecord_secs(&self.app_handle) as f64);
+        let keep = (keep_secs * SAMPLE_RATE as f64) as usize;
+
+        mic.set_sample_cap(None);
+        tap.set_sample_cap(None);
+        let mic_buffered = mic.take_buffer();
+        let sys_buffered = tap.take_buffer();
+        let mic_short = keep.saturating_sub(mic_buffered.len()) as f32 / SAMPLE_RATE as f32;
+        *mic_prefix = align_tail(mic_buffered, keep);
+        *sys_prefix = align_tail(sys_buffered, keep);
+
+        *audio_started = Instant::now() - Duration::from_secs_f64(keep_secs);
+        *started = Local::now() - chrono::Duration::milliseconds((keep_secs * 1000.0) as i64);
+        *standby = false;
+        *calendar = self.spawn_calendar_lookup();
+        let mic_name = mic.device_name();
+        let fallback = *fallback;
+        // Carry the mic's *actual* state across the swap of pills. The
+        // watchdog only emits on a change, so telling the new pill "audio is
+        // flowing" when the stream is already silent would leave it saying so
+        // until the silence ends — the one moment the user is watching.
+        let now_ms = capture_started.elapsed().as_millis() as u64;
+        let last_signal = flow_last_ms.load(Ordering::Relaxed).max(*last_restart_ms);
+        let flowing = now_ms.saturating_sub(last_signal) < MIC_SILENT_RESTART_MS;
+        drop(state);
+
+        log::info!(
+            "Meeting recording started from the rewind buffer: {:.1}s of this call already captured",
+            keep_secs
+        );
+        if mic_short > 1.0 {
+            // Honest about a partial pre-roll rather than silently shipping a
+            // shorter mic track: the far side is all there, the user's own
+            // voice only from the point the mic settled on the right device.
+            log::warn!(
+                "Rewind mic track is {mic_short:.1}s short of the far side (a mid-call mic switch or a silent stream) — padded with silence so the timestamps still line up"
+            );
+        }
+        crate::overlay::show_meeting_recording_indicator(&self.app_handle);
+        crate::overlay::emit_meeting_mic_status(
+            &self.app_handle,
+            mic_name.as_deref(),
+            flowing,
+            fallback,
+        );
+        true
+    }
+
+    /// Drops an unpromoted rewind buffer — the call ended, or the user said
+    /// no. Nothing was ever written, so this is the whole cleanup.
+    pub fn stop_standby(self: &Arc<Self>, reason: &str) -> bool {
+        let taken = {
+            let mut state = self.state.lock().unwrap();
+            if !matches!(*state, MeetingState::Recording { standby: true, .. }) {
+                return false;
+            }
+            std::mem::replace(&mut *state, MeetingState::Idle)
+        };
+        let MeetingState::Recording {
+            mut mic,
+            tap,
+            capture_started,
+            ..
+        } = taken
+        else {
+            return false;
+        };
+        let _ = mic.stop();
+        let _ = mic.close();
+        let _ = tap.stop();
+        // A pill pick belongs to the call it was made on, buffered or not.
+        *self.manual_mic.lock().unwrap() = None;
+        log::info!(
+            "Rewind buffer discarded after {:.0}s ({reason})",
+            capture_started.elapsed().as_secs_f32()
+        );
+        crate::overlay::hide_meeting_prompt(&self.app_handle);
+        true
     }
 
     /// Restarts the meeting mic when it delivers digital silence — the same
@@ -263,9 +559,11 @@ impl MeetingManager {
                 std::thread::sleep(Duration::from_millis(500));
                 let mut state = manager.state.lock().unwrap();
                 let MeetingState::Recording {
+                    standby,
                     mic,
                     mic_prefix,
-                    mic_started,
+                    capture_started,
+                    audio_started,
                     flow_last_ms,
                     last_restart_ms,
                     restarts,
@@ -275,8 +573,9 @@ impl MeetingManager {
                 else {
                     break;
                 };
+                let standby = *standby;
 
-                let now_ms = mic_started.elapsed().as_millis() as u64;
+                let now_ms = capture_started.elapsed().as_millis() as u64;
                 let last_signal = flow_last_ms.load(Ordering::Relaxed).max(*last_restart_ms);
                 let silent_ms = now_ms.saturating_sub(last_signal);
 
@@ -327,17 +626,20 @@ impl MeetingManager {
                         );
                         let partial = mic.stop().unwrap_or_default();
                         let _ = mic.close();
-                        mic_prefix.extend(partial);
-                        let expected =
-                            (mic_started.elapsed().as_secs_f64() * SAMPLE_RATE as f64) as usize;
-                        fit_to_length(mic_prefix, expected);
+                        salvage_partial(
+                            standby,
+                            partial,
+                            mic_prefix,
+                            audio_started,
+                            "a device switch",
+                        );
                         match mic.open(resolution.device).and_then(|_| mic.start()) {
                             Ok(()) => {
                                 *fallback = false;
                                 // A different physical device gets a fresh
                                 // silence budget.
                                 *restarts = 0;
-                                *last_restart_ms = mic_started.elapsed().as_millis() as u64;
+                                *last_restart_ms = capture_started.elapsed().as_millis() as u64;
                                 log::info!(
                                     "Meeting mic switched to {}",
                                     mic.device_name().unwrap_or_else(|| "default".into())
@@ -387,9 +689,13 @@ impl MeetingManager {
                 let prev_device = mic.device_name();
                 let partial = mic.stop().unwrap_or_default();
                 let _ = mic.close();
-                mic_prefix.extend(partial);
-                let expected = (mic_started.elapsed().as_secs_f64() * SAMPLE_RATE as f64) as usize;
-                fit_to_length(mic_prefix, expected);
+                salvage_partial(
+                    standby,
+                    partial,
+                    mic_prefix,
+                    audio_started,
+                    "a silent stream",
+                );
 
                 let resolution = manager.resolve_mic_device();
                 *fallback = resolution.fallback;
@@ -412,14 +718,14 @@ impl MeetingManager {
                                 true,
                                 *fallback,
                             );
-                            *last_restart_ms = mic_started.elapsed().as_millis() as u64;
+                            *last_restart_ms = capture_started.elapsed().as_millis() as u64;
                             continue;
                         }
                     }
                     Err(e) => log::error!("Meeting mic restart failed: {e}"),
                 }
                 *restarts += 1;
-                *last_restart_ms = mic_started.elapsed().as_millis() as u64;
+                *last_restart_ms = capture_started.elapsed().as_millis() as u64;
                 if *restarts == MAX_MIC_RESTARTS {
                     log::error!(
                         "Meeting mic restart limit reached — mic track may be silent from here"
@@ -430,13 +736,17 @@ impl MeetingManager {
     }
 
     fn stop_and_process(self: &Arc<Self>) {
-        let (mut mic, mic_prefix, mic_started, restarts, tap, started, calendar) = {
+        let (mut mic, mic_prefix, sys_prefix, audio_started, restarts, tap, started, calendar) = {
             let mut state = self.state.lock().unwrap();
             match std::mem::replace(&mut *state, MeetingState::Idle) {
+                // Standby is not a recording and cannot be stopped into one:
+                // it is discarded by `stop_standby`, never by this path.
                 MeetingState::Recording {
+                    standby: false,
                     mic,
                     mic_prefix,
-                    mic_started,
+                    sys_prefix,
+                    audio_started,
                     restarts,
                     tap,
                     started,
@@ -445,7 +755,8 @@ impl MeetingManager {
                 } => (
                     mic,
                     mic_prefix,
-                    mic_started,
+                    sys_prefix,
+                    audio_started,
                     restarts,
                     tap,
                     started,
@@ -470,14 +781,17 @@ impl MeetingManager {
             Err(e) => log::error!("Failed to stop meeting mic: {e}"),
         }
         let _ = mic.close();
-        let sys_samples = tap.stop().unwrap_or_else(|e| {
-            log::error!("Failed to stop system tap: {e}");
-            Vec::new()
-        });
+        let mut sys_samples = sys_prefix;
+        match tap.stop() {
+            Ok(samples) => sys_samples.extend(samples),
+            Err(e) => log::error!("Failed to stop system tap: {e}"),
+        }
 
         // A broken Bluetooth stream can run off wall-clock; normalise so
-        // mic timestamps line up with the system track.
-        let wall_secs = mic_started.elapsed().as_secs_f64();
+        // mic timestamps line up with the system track. Measured from the
+        // start of the *audio*, which a promoted rewind buffer puts before
+        // the moment Record was pressed.
+        let wall_secs = audio_started.elapsed().as_secs_f64();
         let expected = (wall_secs * SAMPLE_RATE as f64) as usize;
         let drift = (mic_samples.len() as f64 - expected as f64).abs() / expected.max(1) as f64;
         if drift > 0.05 {
@@ -533,6 +847,7 @@ impl MeetingManager {
                         "saved",
                         "",
                         saved_title.as_deref(),
+                        None,
                         None,
                     );
                 }
@@ -1013,6 +1328,49 @@ impl std::fmt::Display for MicSource {
 /// Outcome of meeting-mic resolution: the device to open (`None` = system
 /// default), the name that was asked for (`None` = nothing specific), why,
 /// and whether a wanted device failed to match anything attached.
+/// Both tracks, open and running, before either a recording or a standby
+/// buffer decides what to do with them.
+struct OpenCapture {
+    mic: AudioRecorder,
+    tap: SystemAudioTap,
+    capture_started: Instant,
+    flow_last_ms: Arc<AtomicU64>,
+    fallback: bool,
+    mic_name: String,
+    source: String,
+}
+
+/// The rewind window in seconds, clamped to something an 8 GB machine can
+/// hold. Read live rather than cached: changing it takes effect on the next
+/// call, with no restart.
+fn prerecord_secs(app: &AppHandle) -> u64 {
+    get_settings(app)
+        .meeting_prerecord_minutes
+        .min(MAX_PRERECORD_MINUTES) as u64
+        * 60
+}
+
+/// Trims a rolling buffer to its last `keep` samples, front-padding with
+/// silence when it holds less than that.
+///
+/// Front, not back: a rolling buffer's contents are the *most recent* audio,
+/// so a track that holds less than the window (a mic that was restarted, a
+/// device that appeared late) is missing its beginning, not its end. Padding
+/// the wrong end would slide every word in that track later than it was
+/// spoken and break the interleave with the far side.
+fn align_tail(mut samples: Vec<f32>, keep: usize) -> Vec<f32> {
+    if samples.len() > keep {
+        samples.drain(..samples.len() - keep);
+        samples
+    } else if samples.len() < keep {
+        let mut padded = vec![0.0; keep - samples.len()];
+        padded.extend(samples);
+        padded
+    } else {
+        samples
+    }
+}
+
 struct MicResolution {
     device: Option<cpal::Device>,
     target: Option<String>,
@@ -1033,6 +1391,38 @@ impl Drop for ProcessingGuard<'_> {
 /// Truncate or zero-pad to the expected wall-clock sample count.
 fn fit_to_length(samples: &mut Vec<f32>, expected: usize) {
     samples.resize(expected, 0.0);
+}
+
+/// What to do with the audio a mic stream had captured when the watchdog
+/// tore it down.
+///
+/// A recording keeps it and normalises the track back to wall-clock, so the
+/// gap becomes silence rather than a timestamp shift. **Standby throws it
+/// away**: the rewind buffer is a rolling window with no fixed origin to
+/// normalise against, and audio captured before a device switch came from a
+/// device the user demonstrably was not talking into — the exact failure
+/// (2026-08-10) that put 36 minutes of the wrong mic in a transcript.
+/// Promotion front-pads whatever is missing, so dropping it costs silence in
+/// the user's own track and nothing at all in the far side's.
+fn salvage_partial(
+    standby: bool,
+    partial: Vec<f32>,
+    mic_prefix: &mut Vec<f32>,
+    audio_started: &Instant,
+    reason: &str,
+) {
+    if standby {
+        if !partial.is_empty() {
+            log::info!(
+                "Rewind buffer dropped {:.1}s of mic audio from the previous device after {reason}",
+                partial.len() as f32 / SAMPLE_RATE as f32
+            );
+        }
+        return;
+    }
+    mic_prefix.extend(partial);
+    let expected = (audio_started.elapsed().as_secs_f64() * SAMPLE_RATE as f64) as usize;
+    fit_to_length(mic_prefix, expected);
 }
 
 /// One JSON object per line, flushed immediately. Deliberately dependency-free
@@ -1340,6 +1730,47 @@ mod tests {
         // padded starts land just before the speech
         assert!(regions[0].0 < 3 * SAMPLE_RATE);
         assert!(regions[1].0 < 10 * SAMPLE_RATE && regions[1].0 > 8 * SAMPLE_RATE);
+    }
+
+    /// An over-full rewind buffer keeps its most recent audio. Dropping the
+    /// wrong end would hand the recording the oldest few minutes of the call
+    /// and lose everything said since.
+    #[test]
+    fn align_tail_keeps_the_most_recent_audio() {
+        let buffer: Vec<f32> = (0..100).map(|i| i as f32).collect();
+        let kept = align_tail(buffer, 10);
+        assert_eq!(kept.len(), 10);
+        assert_eq!(kept[0], 90.0);
+        assert_eq!(kept[9], 99.0);
+    }
+
+    /// A track holding less than the window is missing its *beginning* — a
+    /// mic restarted mid-buffer, or a device that appeared late. The silence
+    /// goes in front so both tracks still end at the same instant, which is
+    /// what keeps the two speakers interleaved at the right timestamps.
+    #[test]
+    fn align_tail_pads_a_short_track_at_the_front() {
+        let buffer: Vec<f32> = vec![7.0, 8.0, 9.0];
+        let kept = align_tail(buffer, 6);
+        assert_eq!(kept, vec![0.0, 0.0, 0.0, 7.0, 8.0, 9.0]);
+    }
+
+    #[test]
+    fn align_tail_leaves_an_exact_fit_alone() {
+        let buffer: Vec<f32> = vec![1.0, 2.0, 3.0];
+        assert_eq!(align_tail(buffer, 3), vec![1.0, 2.0, 3.0]);
+    }
+
+    /// The two tracks are trimmed independently against wall-clock, so the
+    /// mic being short must not shorten the far side — the pair has to come
+    /// out the same length or every timestamp after the gap is wrong.
+    #[test]
+    fn align_tail_gives_both_tracks_the_same_length() {
+        let keep = 8;
+        let mic = align_tail(vec![1.0; 3], keep);
+        let system = align_tail((0..40).map(|i| i as f32).collect(), keep);
+        assert_eq!(mic.len(), system.len());
+        assert_eq!(system[keep - 1], 39.0);
     }
 }
 

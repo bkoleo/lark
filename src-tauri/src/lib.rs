@@ -555,11 +555,33 @@ pub fn run(cli_args: CliArgs) {
                         .state::<Arc<managers::meeting::MeetingManager>>()
                         .inner()
                         .clone();
-                    meeting_manager
-                        .set_manual_mic(if device == "auto" { None } else { Some(device) });
+                    meeting_manager.set_manual_mic(if device == "auto" {
+                        None
+                    } else {
+                        Some(device)
+                    });
                 }
                 #[cfg(not(target_os = "macos"))]
                 let _ = device;
+            } else if let Some(minutes) = args
+                .iter()
+                .position(|a| a == "--meeting-rewind")
+                .and_then(|i| args.get(i + 1))
+                .cloned()
+            {
+                match minutes.parse::<u32>() {
+                    Ok(m) => {
+                        let mut updated = settings::get_settings(app);
+                        updated.meeting_prerecord_minutes = m;
+                        settings::write_settings(app, updated);
+                        log::info!(
+                            "Meeting rewind set to {m} minutes — applies to the next call detected"
+                        );
+                    }
+                    Err(_) => log::error!(
+                        "--meeting-rewind wants a whole number of minutes, got {minutes:?}"
+                    ),
+                }
             } else if let Some(target) = args
                 .iter()
                 .position(|a| a == "--retranscribe-meeting")

@@ -532,6 +532,7 @@ pub fn show_meeting_prompt(
     app_name: &str,
     title: Option<&str>,
     time_range: Option<&str>,
+    buffered_secs: Option<u64>,
 ) {
     place_meeting_window(app_handle, MEETING_CARD_WIDTH, MEETING_CARD_HEIGHT);
     if let Some(window) = app_handle.get_webview_window("meeting_prompt") {
@@ -543,6 +544,33 @@ pub fn show_meeting_prompt(
                 "app": app_name,
                 "title": title,
                 "time_range": time_range,
+                // How far back Record would reach, so the card can promise
+                // it in as many words rather than leaving the user to guess.
+                "buffered_secs": buffered_secs,
+            }),
+        );
+    }
+}
+
+/// The Record button, parked. Once the detection card has had its say the
+/// pill takes its place and stays for the rest of the call — a call Lark is
+/// buffering must never reach a state where there is nothing to click, which
+/// is what sent the user to the tray menu (and cost them the first ten
+/// minutes) before the rewind existed.
+#[cfg(target_os = "macos")]
+pub fn show_meeting_ready_indicator(app_handle: &AppHandle, buffered_secs: u64, cap_secs: u64) {
+    place_meeting_window(app_handle, MEETING_MINI_WIDTH, MEETING_MINI_HEIGHT);
+    if let Some(window) = app_handle.get_webview_window("meeting_prompt") {
+        let _ = window.show();
+        let _ = window.emit(
+            "meeting-ready",
+            serde_json::json!({
+                // Sent rather than counted from the pill's own mount: the
+                // pill is shown again every time a card collapses, and a
+                // counter that restarted each time would under-promise how
+                // far back Record reaches.
+                "buffered_secs": buffered_secs,
+                "cap_secs": cap_secs,
             }),
         );
     }
@@ -554,9 +582,19 @@ pub fn show_meeting_prompt(
 #[cfg(target_os = "macos")]
 pub fn show_meeting_recording_indicator(app_handle: &AppHandle) {
     place_meeting_window(app_handle, MEETING_MINI_WIDTH, MEETING_MINI_HEIGHT);
+    // Read straight from the manager rather than making four call sites pass
+    // it: only one of them (a promoted rewind buffer) knows the answer, and
+    // the pill needs it every time it is shown.
+    let elapsed = app_handle
+        .try_state::<std::sync::Arc<crate::managers::meeting::MeetingManager>>()
+        .and_then(|m| m.recording_elapsed_secs())
+        .unwrap_or(0);
     if let Some(window) = app_handle.get_webview_window("meeting_prompt") {
         let _ = window.show();
-        let _ = window.emit("meeting-recording", ());
+        let _ = window.emit(
+            "meeting-recording",
+            serde_json::json!({ "elapsed_secs": elapsed }),
+        );
     }
 }
 

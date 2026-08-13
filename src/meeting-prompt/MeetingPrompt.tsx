@@ -18,11 +18,33 @@ interface MeetingPromptPayload {
   title?: string | null;
   /** Pre-formatted "1:00 PM – 2:00 PM", when both bounds were known. */
   time_range?: string | null;
+  /** Seconds of this call already buffered, so a Record pressed now would
+   * reach that far back. Null when the rewind is off or not running. */
+  buffered_secs?: number | null;
+}
+
+/** A call is being buffered and Record is one click away. Sent every time
+ * the pill is shown, with the buffer depth measured by the backend. */
+interface MeetingReadyPayload {
+  buffered_secs: number;
+  cap_secs: number;
 }
 
 type Mode =
   | { view: "prompt"; payload: MeetingPromptPayload }
-  | { view: "recording"; startedAt: number };
+  | { view: "recording"; startedAt: number }
+  | { view: "ready"; buffered: number; cap: number; at: number };
+
+/** Buffer depth in the pill, still climbing since the event arrived and
+ * never past the window it is filling. */
+const rewindSecs = (mode: { buffered: number; cap: number; at: number }) =>
+  Math.min(mode.cap, mode.buffered + Math.floor((Date.now() - mode.at) / 1000));
+
+const clock = (secs: number) => {
+  const mm = String(Math.floor(secs / 60)).padStart(2, "0");
+  const ss = String(Math.floor(secs) % 60).padStart(2, "0");
+  return `${mm}:${ss}`;
+};
 
 /** Which mic the meeting recorder has open, and whether audio is arriving.
  * `fallback` = system default opened because the pinned mic wasn't attached. */
@@ -65,12 +87,31 @@ const MeetingPrompt: React.FC = () => {
           setMode({ view: "prompt", payload: event.payload });
         },
       );
-      const unlistenRecording = await listen("meeting-recording", () => {
-        if (recordingStartRef.current == null) {
-          recordingStartRef.current = Date.now();
-        }
-        setMode({ view: "recording", startedAt: recordingStartRef.current });
-      });
+      const unlistenRecording = await listen<{ elapsed_secs?: number }>(
+        "meeting-recording",
+        (event) => {
+          if (recordingStartRef.current == null) {
+            // Seeded from the backend so a recording promoted out of the
+            // rewind buffer opens at what it already holds — 10:32, not
+            // 00:00 — rather than reading as if the call started now.
+            recordingStartRef.current =
+              Date.now() - (event.payload?.elapsed_secs ?? 0) * 1000;
+          }
+          setMode({ view: "recording", startedAt: recordingStartRef.current });
+        },
+      );
+      const unlistenReady = await listen<MeetingReadyPayload>(
+        "meeting-ready",
+        async (event) => {
+          await syncLanguageFromSettings();
+          setMode({
+            view: "ready",
+            buffered: event.payload.buffered_secs,
+            cap: event.payload.cap_secs,
+            at: Date.now(),
+          });
+        },
+      );
       const unlistenMicStatus = await listen<MicStatus>(
         "meeting-mic-status",
         (event) => setMicStatus(event.payload),
@@ -78,31 +119,43 @@ const MeetingPrompt: React.FC = () => {
       return () => {
         unlistenPrompt();
         unlistenRecording();
+        unlistenReady();
         unlistenMicStatus();
       };
     };
     setup();
   }, []);
 
-  // Unanswered prompts dismiss themselves (collapsing back to the
-  // indicator if a recording is running — the backend decides).
+  // Unanswered prompts put themselves away. "collapse", not "dismiss": a
+  // card that timed out is not a refusal, and the backend decides what the
+  // window falls back to — the recording pill, the Record-ready pill, or
+  // nothing at all.
   useEffect(() => {
     if (mode?.view !== "prompt") return;
     // The "saved" confirmation is a brief beat; the actionable prompts wait
     // longer for the user to respond.
     const ms = mode.payload.kind === "saved" ? 6000 : 20000;
-    const timer = setTimeout(() => answer("dismiss"), ms);
+    const timer = setTimeout(() => answer("collapse"), ms);
     return () => clearTimeout(timer);
   }, [mode]);
 
-  // Tick the elapsed timer while recording.
+  // Tick the elapsed timer while recording, and the rewind depth while a
+  // call is being buffered.
   useEffect(() => {
-    if (mode?.view !== "recording") return;
+    if (mode?.view !== "recording" && mode?.view !== "ready") return;
     const ticker = setInterval(() => setClockTick((n) => n + 1), 1000);
     return () => clearInterval(ticker);
   }, [mode]);
 
-  const answer = (action: "record" | "stop" | "dismiss" | "expand_stop") => {
+  const answer = (
+    action:
+      | "record"
+      | "stop"
+      | "dismiss"
+      | "collapse"
+      | "expand_stop"
+      | "expand_record",
+  ) => {
     if (action === "record" || action === "stop") {
       recordingStartRef.current = null;
       setMicStatus(null);
@@ -158,81 +211,117 @@ const MeetingPrompt: React.FC = () => {
 
   if (!mode) return null;
 
+  // The mic label answers "which mic is this?" at a glance: normal = the
+  // resolved mic; amber = default fallback (pinned mic not attached); red
+  // NO AUDIO = the open stream is delivering silence. It matters as much
+  // before Record as after — a rewind buffer filling from the wrong device
+  // is worth catching while it can still be fixed.
+  const micLabel =
+    micStatus &&
+    (micStatus.flowing
+      ? (micStatus.mic ?? t("meetingPrompt.defaultMic"))
+      : t("meetingPrompt.noAudio"));
+  const micClass = micStatus
+    ? !micStatus.flowing
+      ? " err"
+      : micStatus.fallback
+        ? " warn"
+        : ""
+    : "";
+
+  /** Both pills — recording and Record-ready — are the same dark pill with
+   * the same clickable mic name and device picker; only the dot, the label
+   * and what a click expands into differ. */
+  const miniPill = (opts: {
+    dotClass: string;
+    pillClass?: string;
+    label: string;
+    ariaLabel: string;
+    onClick: () => void;
+  }) => (
+    <div className="meeting-mini-wrap">
+      <button
+        className={`meeting-mini fade-in${opts.pillClass ?? ""}`}
+        onClick={opts.onClick}
+        aria-label={opts.ariaLabel}
+      >
+        <span className={opts.dotClass} />
+        <span className="meeting-mini-time">{opts.label}</span>
+        {micLabel && (
+          <span
+            className={`meeting-mini-mic${micClass} clickable`}
+            title={t("meetingPrompt.pickMic")}
+            onClick={(e) => {
+              // The pill button expands to a card; the mic name is its own
+              // target — it opens the device picker instead.
+              e.stopPropagation();
+              if (micOptions) {
+                closePicker();
+              } else {
+                void openPicker();
+              }
+            }}
+          >
+            {micLabel}
+          </span>
+        )}
+      </button>
+      {micOptions && (
+        <div className="meeting-mic-menu fade-in">
+          <button className="meeting-mic-item" onClick={() => pickMic("")}>
+            <span className="meeting-mic-item-name auto">
+              {t("meetingPrompt.autoMic")}
+            </span>
+          </button>
+          {micOptions.map((d) => (
+            <button
+              key={d.index}
+              className="meeting-mic-item"
+              onClick={() => pickMic(d.name)}
+            >
+              <span className="meeting-mic-item-name">{d.name}</span>
+              {micStatus?.mic === d.name && (
+                <CheckIcon width={11} height={11} color="#34c759" />
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+
   if (mode.view === "recording") {
     const elapsed = Math.max(
       0,
       Math.floor((Date.now() - mode.startedAt) / 1000),
     );
-    const mm = String(Math.floor(elapsed / 60)).padStart(2, "0");
-    const ss = String(elapsed % 60).padStart(2, "0");
-    // The mic label answers "which mic is this recording?" at a glance:
-    // normal = the pinned mic; amber = default fallback (pinned mic not
-    // attached); red NO AUDIO = the open stream is delivering silence.
-    const micLabel =
-      micStatus &&
-      (micStatus.flowing
-        ? (micStatus.mic ?? t("meetingPrompt.defaultMic"))
-        : t("meetingPrompt.noAudio"));
-    const micClass = micStatus
-      ? !micStatus.flowing
-        ? " err"
-        : micStatus.fallback
-          ? " warn"
-          : ""
-      : "";
-    return (
-      <div className="meeting-mini-wrap">
-        <button
-          className="meeting-mini fade-in"
-          onClick={() => answer("expand_stop")}
-          aria-label={t("meetingPrompt.recording")}
-        >
-          <span className="meeting-mini-dot" />
-          <span className="meeting-mini-time">
-            {mm}:{ss}
-          </span>
-          {micLabel && (
-            <span
-              className={`meeting-mini-mic${micClass} clickable`}
-              title={t("meetingPrompt.pickMic")}
-              onClick={(e) => {
-                // The pill button expands to the Stop card; the mic name is
-                // its own target — it opens the device picker instead.
-                e.stopPropagation();
-                if (micOptions) {
-                  closePicker();
-                } else {
-                  void openPicker();
-                }
-              }}
-            >
-              {micLabel}
-            </span>
-          )}
-        </button>
-        {micOptions && (
-          <div className="meeting-mic-menu fade-in">
-            <button className="meeting-mic-item" onClick={() => pickMic("")}>
-              <span className="meeting-mic-item-name auto">
-                {t("meetingPrompt.autoMic")}
-              </span>
-            </button>
-            {micOptions.map((d) => (
-              <button
-                key={d.index}
-                className="meeting-mic-item"
-                onClick={() => pickMic(d.name)}
-              >
-                <span className="meeting-mic-item-name">{d.name}</span>
-                {micStatus?.mic === d.name && (
-                  <CheckIcon width={11} height={11} color="#34c759" />
-                )}
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
-    );
+    return miniPill({
+      dotClass: "meeting-mini-dot",
+      label: clock(elapsed),
+      ariaLabel: t("meetingPrompt.recording"),
+      onClick: () => answer("expand_stop"),
+    });
+  }
+
+  // Record, parked for the length of the call. The clock is how far back it
+  // reaches, not how long anything has been recording — nothing is being
+  // kept yet. Below a minute there is nothing worth promising, so the pill
+  // is just the word.
+  if (mode.view === "ready") {
+    const depth = rewindSecs(mode);
+    return miniPill({
+      dotClass: "meeting-mini-dot ready",
+      // Carries a word the recording pill doesn't, so the mic name gets less
+      // room before the pill would outgrow its window and clip at the screen
+      // edge.
+      pillClass: " ready",
+      label:
+        depth >= 60
+          ? `${t("overlay.record")} ${clock(depth)}`
+          : t("overlay.record"),
+      ariaLabel: t("meetingPrompt.readyAria"),
+      onClick: () => answer("expand_record"),
+    });
   }
 
   const { payload } = mode;
@@ -288,6 +377,15 @@ const MeetingPrompt: React.FC = () => {
         : t("meetingPrompt.stopPrompt")
       : t("meetingPrompt.stopPrompt");
 
+  // The second line of the Record button is where the rewind is promised —
+  // on the control that will honour it, rather than in a note beside it.
+  // Under a minute there is nothing to promise and it stays "this meeting".
+  const buffered = payload.buffered_secs ?? 0;
+  const recordSubtitle =
+    isStart && buffered >= 60
+      ? t("meetingPrompt.recordRewind", { time: clock(buffered) })
+      : t("meetingPrompt.recordSubtitle");
+
   return (
     <div className="meeting-card fade-in">
       <div className={`meeting-card-accent${isStart ? "" : " blue"}`} />
@@ -310,9 +408,7 @@ const MeetingPrompt: React.FC = () => {
               {isStart ? t("overlay.record") : t("overlay.stop")}
             </span>
             <span className="l2">
-              {isStart
-                ? t("meetingPrompt.recordSubtitle")
-                : t("meetingPrompt.stopSubtitle")}
+              {isStart ? recordSubtitle : t("meetingPrompt.stopSubtitle")}
             </span>
           </span>
         </button>
