@@ -1161,8 +1161,11 @@ impl MeetingManager {
 never invent names for them.\n\n\
 Write, in this order and nothing else:\n\
 1. A `### Summary` section: 3-5 plain sentences on what the meeting was about and what was decided.\n\
-2. An `### Action items` section: a markdown checklist (`- [ ] `), each line naming who owns it \
-(Kole, or Them if it is the other side).\n\
+2. An `### Action items` section: a markdown checklist (`- [ ] `), each line naming who owns it. \
+Use \"Kole\" when the transcript makes that clear, or a specific name only if the transcript \
+genuinely names that person. Otherwise write \"The team\" — never \"Them\": that word is a \
+transcript-only speaker label, not a name to write into what you produce. If an item plainly \
+has no distinct owner, drop the owner and state the item on its own line.\n\
 3. An `### Open questions` section only if something was explicitly left unresolved.\n\n\
 Sections 2 and 3 are optional: if there is nothing to put in one, leave the heading out \
 altogether. Never write a heading followed by \"none\" or \"nothing\" — an empty section is \
