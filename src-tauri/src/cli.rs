@@ -45,6 +45,11 @@ pub struct CliArgs {
     #[arg(long, value_name = "MINUTES")]
     pub meeting_rewind: Option<u32>,
 
+    /// How many minutes before a calendar event to pop the reminder card.
+    /// 0 turns the reminder off (sent to running instance, macOS only)
+    #[arg(long, value_name = "MINUTES")]
+    pub meeting_reminder: Option<u32>,
+
     /// Enable debug mode with verbose logging
     #[arg(long)]
     pub debug: bool,

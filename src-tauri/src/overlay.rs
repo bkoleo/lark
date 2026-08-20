@@ -552,6 +552,29 @@ pub fn show_meeting_prompt(
     }
 }
 
+/// Heads-up card for a calendar event about to start: title plus a
+/// "starts in N min" line, no action button. Sent on the same
+/// "meeting-prompt" event as the detection card so the panel's existing
+/// timeout/collapse plumbing applies — its × and its timeout both
+/// `collapse`, never `dismiss`, because closing a reminder must not throw
+/// away a rewind buffer the call detector happens to be filling.
+#[cfg(target_os = "macos")]
+pub fn show_meeting_upcoming(app_handle: &AppHandle, title: &str, minutes: u32) {
+    place_meeting_window(app_handle, MEETING_CARD_WIDTH, MEETING_CARD_HEIGHT);
+    if let Some(window) = app_handle.get_webview_window("meeting_prompt") {
+        let _ = window.show();
+        let _ = window.emit(
+            "meeting-prompt",
+            serde_json::json!({
+                "kind": "upcoming",
+                "app": "",
+                "title": title,
+                "minutes": minutes,
+            }),
+        );
+    }
+}
+
 /// The Record button, parked. Once the detection card has had its say the
 /// pill takes its place and stays for the rest of the call — a call Lark is
 /// buffering must never reach a state where there is nothing to click, which

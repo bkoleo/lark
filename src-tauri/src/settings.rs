@@ -431,6 +431,11 @@ pub struct AppSettings {
     /// discarded when the call ends unless it was promoted to a recording.
     #[serde(default = "default_meeting_prerecord_minutes")]
     pub meeting_prerecord_minutes: u32,
+    /// Minutes before the next calendar event to pop the reminder card.
+    /// 0 turns the reminder off. No settings-UI control yet — settable live
+    /// with `Lark --meeting-reminder <minutes>`.
+    #[serde(default = "default_meeting_reminder_minutes")]
+    pub meeting_reminder_minutes: u32,
     #[serde(default)]
     pub mute_while_recording: bool,
     #[serde(default)]
@@ -574,6 +579,12 @@ fn default_meeting_notes_max_chars() -> usize {
 /// enough to stay unnoticeable on an 8 GB machine.
 fn default_meeting_prerecord_minutes() -> u32 {
     10
+}
+
+/// One minute: late enough to be a "wrap up and join" nudge rather than an
+/// early alarm, and what Kole asked for by name.
+fn default_meeting_reminder_minutes() -> u32 {
+    1
 }
 
 /// `~/Documents/Claude/Meetings` — inside the Cowork mount on purpose.
@@ -877,6 +888,7 @@ pub fn get_default_settings() -> AppSettings {
         meeting_notes_max_chars: default_meeting_notes_max_chars(),
         meetings_folder: default_meetings_folder(),
         meeting_prerecord_minutes: default_meeting_prerecord_minutes(),
+        meeting_reminder_minutes: default_meeting_reminder_minutes(),
         mute_while_recording: false,
         append_trailing_space: false,
         app_language: default_app_language(),

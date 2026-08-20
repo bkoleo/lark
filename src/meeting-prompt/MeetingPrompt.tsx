@@ -12,7 +12,7 @@ import { syncLanguageFromSettings } from "@/i18n";
 import "./MeetingPrompt.css";
 
 interface MeetingPromptPayload {
-  kind: "start" | "stop" | "stop_ask" | "saved";
+  kind: "start" | "stop" | "stop_ask" | "saved" | "upcoming";
   app: string;
   /** Real calendar event title, when the calendar matched. */
   title?: string | null;
@@ -21,6 +21,8 @@ interface MeetingPromptPayload {
   /** Seconds of this call already buffered, so a Record pressed now would
    * reach that far back. Null when the rewind is off or not running. */
   buffered_secs?: number | null;
+  /** "upcoming" only: how many minutes out the event is. */
+  minutes?: number | null;
 }
 
 /** A call is being buffered and Record is one click away. Sent every time
@@ -133,8 +135,15 @@ const MeetingPrompt: React.FC = () => {
   useEffect(() => {
     if (mode?.view !== "prompt") return;
     // The "saved" confirmation is a brief beat; the actionable prompts wait
-    // longer for the user to respond.
-    const ms = mode.payload.kind === "saved" ? 6000 : 20000;
+    // longer for the user to respond; the "upcoming" reminder holds until
+    // the meeting it announces has started, then puts itself away — capped,
+    // so a long reminder lead can't park a card on screen for an hour.
+    const ms =
+      mode.payload.kind === "saved"
+        ? 6000
+        : mode.payload.kind === "upcoming"
+          ? Math.min(mode.payload.minutes ?? 1, 5) * 60000
+          : 20000;
     const timer = setTimeout(() => answer("collapse"), ms);
     return () => clearTimeout(timer);
   }, [mode]);
@@ -326,6 +335,38 @@ const MeetingPrompt: React.FC = () => {
 
   const { payload } = mode;
   const hasCalendarTitle = !!payload.title;
+
+  // Heads-up that a calendar event is about to start. No action button —
+  // recording is the detection card's offer, made when a call app actually
+  // opens the mic. The × collapses rather than dismisses: closing a
+  // reminder is not a refusal to record, and must never drop a rewind
+  // buffer the call detector is filling.
+  if (payload.kind === "upcoming") {
+    return (
+      <div className="meeting-card fade-in">
+        <div className="meeting-card-accent" />
+        <div className="meeting-card-body">
+          <div className="meeting-card-text">
+            <div className="meeting-card-title">
+              {payload.title || t("meetingPrompt.upcomingTitle")}
+            </div>
+            <div className="meeting-card-time">
+              {t("meetingPrompt.upcomingSubtitle", {
+                minutes: payload.minutes ?? 1,
+              })}
+            </div>
+          </div>
+          <button
+            className="meeting-card-dismiss"
+            onClick={() => answer("collapse")}
+            aria-label={t("meetingPrompt.dismiss")}
+          >
+            <CancelIcon />
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   // "Recorded successfully" closure beat shown after a meeting transcript is
   // written — reassurance without stealing focus, then auto-dismisses.

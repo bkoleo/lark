@@ -654,7 +654,9 @@
     "noAudio": "No audio",
     "pickMic": "Choose which mic to record",
     "autoMic": "Automatic (follow the call)",
-    "readyAria": "Record this call"
+    "readyAria": "Record this call",
+    "upcomingTitle": "Upcoming meeting",
+    "upcomingSubtitle": "Starts in {{minutes}} min"
   },
   "meetings": {
     "searchPlaceholder": "Search meetings…",

@@ -187,16 +187,27 @@ pub fn refresh_next_meeting(app: &AppHandle) {
     }
 }
 
-/// Keep the menu bar label current.
+/// How often the calendar is consulted — for the menu bar label and for the
+/// meeting reminder card, which shares this loop. An EventKit read of one
+/// day's events is cheap enough that the tight loop costs nothing worth
+/// saving, and the reminder's precision depends on it: it may hold up to one
+/// tick to land exactly on its lead, so the tick bounds that stall.
+#[cfg(target_os = "macos")]
+pub const MEETING_TICK_SECS: u64 = 15;
+
+/// Keep the menu bar label current, and pop the reminder card when the next
+/// event is a minute out.
 ///
-/// Thirty seconds against a minute-granularity countdown means the number is
-/// never more than half a minute stale, and an EventKit read of one day's
-/// events is cheap enough that the tighter loop costs nothing worth saving.
+/// One loop for both on purpose: EventKit goes blind after a handful of
+/// stores per process (see `meeting_calendar::with_store`), and the store is
+/// thread-local — every calendar consumer on this thread shares the one
+/// store the process can afford to keep.
 #[cfg(target_os = "macos")]
 pub fn start_next_meeting_updates(app: AppHandle) {
     std::thread::spawn(move || loop {
         refresh_next_meeting(&app);
-        std::thread::sleep(std::time::Duration::from_secs(30));
+        crate::meeting_reminder::tick(&app);
+        std::thread::sleep(std::time::Duration::from_secs(MEETING_TICK_SECS));
     });
 }
 

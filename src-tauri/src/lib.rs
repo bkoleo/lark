@@ -11,6 +11,7 @@ mod input;
 mod llm_client;
 mod maintenance;
 mod managers;
+mod meeting_reminder;
 mod overlay;
 mod paste_guard;
 pub mod portable;
@@ -580,6 +581,25 @@ pub fn run(cli_args: CliArgs) {
                     }
                     Err(_) => log::error!(
                         "--meeting-rewind wants a whole number of minutes, got {minutes:?}"
+                    ),
+                }
+            } else if let Some(minutes) = args
+                .iter()
+                .position(|a| a == "--meeting-reminder")
+                .and_then(|i| args.get(i + 1))
+                .cloned()
+            {
+                match minutes.parse::<u32>() {
+                    Ok(m) => {
+                        let mut updated = settings::get_settings(app);
+                        updated.meeting_reminder_minutes = m;
+                        settings::write_settings(app, updated);
+                        log::info!(
+                            "Meeting reminder set to {m} minutes before each event (0 = off)"
+                        );
+                    }
+                    Err(_) => log::error!(
+                        "--meeting-reminder wants a whole number of minutes, got {minutes:?}"
                     ),
                 }
             } else if let Some(target) = args
