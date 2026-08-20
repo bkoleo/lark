@@ -436,6 +436,12 @@ pub struct AppSettings {
     /// with `Lark --meeting-reminder <minutes>`.
     #[serde(default = "default_meeting_reminder_minutes")]
     pub meeting_reminder_minutes: u32,
+    /// User-dragged position of the meeting card/pill window, as the
+    /// window's top-right corner relative to the monitor's top-left, in
+    /// logical points. Right-edge anchored because the window is shown at
+    /// several widths and its content right-aligns. None = top-right preset.
+    #[serde(default)]
+    pub meeting_card_custom_offset: Option<(f64, f64)>,
     #[serde(default)]
     pub mute_while_recording: bool,
     #[serde(default)]
@@ -889,6 +895,7 @@ pub fn get_default_settings() -> AppSettings {
         meetings_folder: default_meetings_folder(),
         meeting_prerecord_minutes: default_meeting_prerecord_minutes(),
         meeting_reminder_minutes: default_meeting_reminder_minutes(),
+        meeting_card_custom_offset: None,
         mute_while_recording: false,
         append_trailing_space: false,
         app_language: default_app_language(),

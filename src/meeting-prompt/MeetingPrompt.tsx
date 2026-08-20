@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow, LogicalPosition } from "@tauri-apps/api/window";
 import React, { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
@@ -218,6 +219,71 @@ const MeetingPrompt: React.FC = () => {
     return () => clearTimeout(timer);
   }, [micOptions]);
 
+  // Manual window drag, as on the recording overlay (a non-activating
+  // NSPanel ignores the native startDragging API) — but with a movement
+  // threshold before the pointer is captured. The overlay captures on
+  // pointer-down, and capture retargets the eventual click to the capture
+  // target (the bug that killed its Copy button). Here everything is a
+  // click target — the pill expands, the mic name opens the picker, the
+  // cards carry buttons — so a plain click must never see capture. Only
+  // once the pointer has actually travelled does the drag begin; the same
+  // retargeting then swallows the stray click at drag-end, which is
+  // exactly right.
+  const dragRef = React.useRef<{
+    el: HTMLElement;
+    pointerId: number;
+    mx: number;
+    my: number;
+    wx: number;
+    wy: number;
+    captured: boolean;
+  } | null>(null);
+
+  const startDrag = async (e: React.PointerEvent) => {
+    const el = e.currentTarget as HTMLElement;
+    const pointerId = e.pointerId;
+    const mx = e.screenX;
+    const my = e.screenY;
+    const win = getCurrentWindow();
+    const [pos, scale] = await Promise.all([
+      win.outerPosition(),
+      win.scaleFactor(),
+    ]);
+    dragRef.current = {
+      el,
+      pointerId,
+      mx,
+      my,
+      wx: pos.x / scale,
+      wy: pos.y / scale,
+      captured: false,
+    };
+  };
+
+  const onDragMove = (e: React.PointerEvent) => {
+    const d = dragRef.current;
+    if (!d) return;
+    const dx = e.screenX - d.mx;
+    const dy = e.screenY - d.my;
+    if (!d.captured) {
+      if (Math.abs(dx) < 5 && Math.abs(dy) < 5) return;
+      d.el.setPointerCapture(d.pointerId);
+      d.captured = true;
+    }
+    getCurrentWindow().setPosition(new LogicalPosition(d.wx + dx, d.wy + dy));
+  };
+
+  const endDrag = () => {
+    dragRef.current = null;
+  };
+
+  const dragProps = {
+    onPointerDown: startDrag,
+    onPointerMove: onDragMove,
+    onPointerUp: endDrag,
+    onPointerCancel: endDrag,
+  };
+
   if (!mode) return null;
 
   // The mic label answers "which mic is this?" at a glance: normal = the
@@ -248,7 +314,7 @@ const MeetingPrompt: React.FC = () => {
     ariaLabel: string;
     onClick: () => void;
   }) => (
-    <div className="meeting-mini-wrap">
+    <div className="meeting-mini-wrap" {...dragProps}>
       <button
         className={`meeting-mini fade-in${opts.pillClass ?? ""}`}
         onClick={opts.onClick}
@@ -343,7 +409,7 @@ const MeetingPrompt: React.FC = () => {
   // buffer the call detector is filling.
   if (payload.kind === "upcoming") {
     return (
-      <div className="meeting-card fade-in">
+      <div className="meeting-card fade-in" {...dragProps}>
         <div className="meeting-card-accent" />
         <div className="meeting-card-body">
           <div className="meeting-card-text">
@@ -372,7 +438,7 @@ const MeetingPrompt: React.FC = () => {
   // written — reassurance without stealing focus, then auto-dismisses.
   if (payload.kind === "saved") {
     return (
-      <div className="meeting-card saved fade-in">
+      <div className="meeting-card saved fade-in" {...dragProps}>
         <div className="meeting-card-accent green" />
         <div className="meeting-card-body">
           <div className="meeting-card-check">
@@ -428,7 +494,7 @@ const MeetingPrompt: React.FC = () => {
       : t("meetingPrompt.recordSubtitle");
 
   return (
-    <div className="meeting-card fade-in">
+    <div className="meeting-card fade-in" {...dragProps}>
       <div className={`meeting-card-accent${isStart ? "" : " blue"}`} />
       <div className="meeting-card-body">
         <div className="meeting-card-text">

@@ -453,25 +453,124 @@ const MEETING_MINI_WIDTH: f64 = 260.0;
 const MEETING_MINI_HEIGHT: f64 = 48.0;
 
 /// Top-right corner of the monitor the cursor is on (Granola puts its
-/// meeting card there; Kole asked for the same).
+/// meeting card there; Kole asked for the same) — unless the user has
+/// dragged the pill somewhere, in which case their spot wins.
 #[cfg(target_os = "macos")]
-fn meeting_window_position(app_handle: &AppHandle, width: f64) -> Option<(f64, f64)> {
+fn meeting_window_position(app_handle: &AppHandle, width: f64, height: f64) -> Option<(f64, f64)> {
     let monitor = get_monitor_with_cursor(app_handle)?;
     let scale = monitor.scale_factor();
-    let x =
-        monitor.position().x as f64 / scale + monitor.size().width as f64 / scale - width - 12.0;
-    let y = monitor.position().y as f64 / scale + 42.0;
+    let monitor_x = monitor.position().x as f64 / scale;
+    let monitor_y = monitor.position().y as f64 / scale;
+    let monitor_w = monitor.size().width as f64 / scale;
+    let monitor_h = monitor.size().height as f64 / scale;
+
+    // A user-dragged position wins over the preset. Stored as the window's
+    // TOP-RIGHT corner relative to the monitor's top-left: this window is
+    // shown at several widths (360 card, 260 pill) and its content
+    // right-aligns, so the right edge is the visual anchor that must hold
+    // steady while the width changes underneath it. Clamped so neither a
+    // drag near an edge nor the picker menu growing the window can leave
+    // any of it off-screen.
+    let settings = settings::get_settings(app_handle);
+    if let Some((right, oy)) = settings.meeting_card_custom_offset {
+        return Some(clamped_meeting_anchor(
+            (right, oy),
+            (monitor_x, monitor_y, monitor_w, monitor_h),
+            width,
+            height,
+        ));
+    }
+
+    let x = monitor_x + monitor_w - width - 12.0;
+    let y = monitor_y + 42.0;
     Some((x, y))
+}
+
+/// Pure placement math for a user-anchored meeting window, split out so the
+/// clamping is testable without a monitor. `anchor` is (right-edge-x, top-y)
+/// relative to the monitor's top-left, in logical points.
+fn clamped_meeting_anchor(
+    anchor: (f64, f64),
+    monitor: (f64, f64, f64, f64),
+    width: f64,
+    height: f64,
+) -> (f64, f64) {
+    let (right, top) = anchor;
+    let (mx, my, mw, mh) = monitor;
+    let x = (mx + right - width).clamp(mx, (mx + mw - width).max(mx));
+    let y = (my + top).clamp(my, (my + mh - height).max(my));
+    (x, y)
 }
 
 #[cfg(target_os = "macos")]
 fn place_meeting_window(app_handle: &AppHandle, width: f64, height: f64) {
+    // Mark this move as Lark's own so the drag tracker doesn't mistake the
+    // routine re-placement before every show for the user dragging.
+    *LAST_PROGRAMMATIC_MEETING_MOVE.lock().unwrap() = Some(Instant::now());
     if let Some(window) = app_handle.get_webview_window("meeting_prompt") {
         let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize { width, height }));
-        if let Some((x, y)) = meeting_window_position(app_handle, width) {
+        if let Some((x, y)) = meeting_window_position(app_handle, width, height) {
             let _ = window.set_position(tauri::Position::Logical(tauri::LogicalPosition { x, y }));
         }
     }
+}
+
+/// Set whenever Lark itself repositions the meeting window. Separate from the
+/// recording overlay's marker — the two windows move independently and one
+/// window's programmatic hop must not mask a user drag on the other.
+#[cfg(target_os = "macos")]
+static LAST_PROGRAMMATIC_MEETING_MOVE: Mutex<Option<Instant>> = Mutex::new(None);
+#[cfg(target_os = "macos")]
+static MEETING_DRAG_SAVE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Watches the meeting pill/card for user drags and persists the dropped
+/// position (debounced) as a monitor-relative right-edge anchor. Mirror of
+/// [`attach_overlay_drag_tracking`]; the frontend moves the window with
+/// `setPosition` during the drag, and this listener is what makes the spot
+/// survive the next show and the next launch.
+#[cfg(target_os = "macos")]
+fn attach_meeting_drag_tracking(app_handle: &AppHandle) {
+    let Some(window) = app_handle.get_webview_window("meeting_prompt") else {
+        return;
+    };
+    let app = app_handle.clone();
+    let win = window.clone();
+    window.on_window_event(move |event| {
+        let tauri::WindowEvent::Moved(pos) = event else {
+            return;
+        };
+        if let Some(t) = *LAST_PROGRAMMATIC_MEETING_MOVE.lock().unwrap() {
+            if t.elapsed() < std::time::Duration::from_millis(600) {
+                return;
+            }
+        }
+        let pos = *pos;
+        let gen = MEETING_DRAG_SAVE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        let app = app.clone();
+        let win = win.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            if MEETING_DRAG_SAVE_GENERATION.load(Ordering::SeqCst) != gen {
+                return;
+            }
+            let Ok(Some(monitor)) = win.current_monitor() else {
+                return;
+            };
+            // The width at save time turns the top-left the OS reports into
+            // the right-edge anchor the placement math wants.
+            let Ok(size) = win.outer_size() else {
+                return;
+            };
+            let scale = monitor.scale_factor();
+            let right = pos.x as f64 / scale + size.width as f64 / scale
+                - monitor.position().x as f64 / scale;
+            let oy = pos.y as f64 / scale - monitor.position().y as f64 / scale;
+            let mut settings = settings::get_settings(&app);
+            settings.meeting_card_custom_offset = Some((right, oy));
+            settings::write_settings(&app, settings);
+            log::info!("Saved meeting card custom position (right edge {right:.0}, top {oy:.0})");
+        });
+    });
 }
 
 /// Creates the meeting-prompt card window (hidden until a meeting is
@@ -480,7 +579,9 @@ fn place_meeting_window(app_handle: &AppHandle, width: f64, height: f64) {
 /// transient top-right ask.
 #[cfg(target_os = "macos")]
 pub fn create_meeting_prompt_window(app_handle: &AppHandle) {
-    let Some((x, y)) = meeting_window_position(app_handle, MEETING_CARD_WIDTH) else {
+    let Some((x, y)) =
+        meeting_window_position(app_handle, MEETING_CARD_WIDTH, MEETING_CARD_HEIGHT)
+    else {
         return;
     };
     match PanelBuilder::<_, RecordingOverlayPanel>::new(app_handle, "meeting_prompt")
@@ -513,6 +614,7 @@ pub fn create_meeting_prompt_window(app_handle: &AppHandle) {
     {
         Ok(panel) => {
             let _ = panel.hide();
+            attach_meeting_drag_tracking(app_handle);
         }
         Err(e) => log::error!("Failed to create meeting prompt panel: {e}"),
     }
@@ -755,5 +857,50 @@ pub fn emit_levels(app_handle: &AppHandle, levels: &Vec<f32>) {
     // also emit to the recording overlay if it's open
     if let Some(overlay_window) = app_handle.get_webview_window("recording_overlay") {
         let _ = overlay_window.emit("mic-level", levels);
+    }
+}
+
+#[cfg(test)]
+mod meeting_anchor_tests {
+    use super::clamped_meeting_anchor;
+
+    const MONITOR: (f64, f64, f64, f64) = (0.0, 0.0, 1512.0, 982.0);
+
+    #[test]
+    fn the_right_edge_holds_across_width_changes() {
+        // Same anchor, pill width vs card width: the right edges must line
+        // up, which is the whole reason the anchor is right-edge based.
+        let (pill_x, _) = clamped_meeting_anchor((800.0, 300.0), MONITOR, 260.0, 48.0);
+        let (card_x, _) = clamped_meeting_anchor((800.0, 300.0), MONITOR, 360.0, 84.0);
+        assert_eq!(pill_x + 260.0, card_x + 360.0);
+    }
+
+    #[test]
+    fn a_drag_past_an_edge_stays_on_screen() {
+        let (x, y) = clamped_meeting_anchor((5000.0, -50.0), MONITOR, 360.0, 84.0);
+        assert_eq!(x, 1512.0 - 360.0);
+        assert_eq!(y, 0.0);
+    }
+
+    #[test]
+    fn the_picker_menu_growing_near_the_bottom_shifts_the_window_up() {
+        // Pill parked 40pts above the bottom; the menu grows the height past
+        // that, and the window must ride up rather than clip.
+        let (_, y) = clamped_meeting_anchor((800.0, 982.0 - 40.0), MONITOR, 260.0, 328.0);
+        assert_eq!(y, 982.0 - 328.0);
+    }
+
+    #[test]
+    fn a_secondary_monitor_offset_is_respected() {
+        let monitor = (-1512.0, 100.0, 1512.0, 982.0);
+        let (x, y) = clamped_meeting_anchor((700.0, 200.0), monitor, 260.0, 48.0);
+        assert_eq!(x, -1512.0 + 700.0 - 260.0);
+        assert_eq!(y, 300.0);
+    }
+
+    #[test]
+    fn a_window_wider_than_the_anchor_clamps_to_the_left_edge() {
+        let (x, _) = clamped_meeting_anchor((100.0, 10.0), MONITOR, 360.0, 84.0);
+        assert_eq!(x, 0.0);
     }
 }
