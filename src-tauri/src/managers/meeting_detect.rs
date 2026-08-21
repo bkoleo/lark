@@ -208,12 +208,27 @@ pub fn spawn_meeting_detector(app_handle: &AppHandle) {
                     log::info!("Auto-stopping meeting recording (call ended, no action taken)");
                     if let Some(manager) = app.try_state::<Arc<MeetingManager>>() {
                         let manager = manager.inner().clone();
-                        manager.toggle();
-                        crate::tray::update_tray_menu(
-                            &app,
-                            &crate::tray::TrayIconState::Idle,
-                            None,
-                        );
+                        let app_for_stop = app.clone();
+                        // Off the detector's own thread, deliberately
+                        // (t17873258798635ef6, 2026-08-21). `toggle()` ->
+                        // `stop_and_process()` used to be able to block
+                        // forever on a dead audio device (`mic.close()`'s
+                        // unconditional `worker_handle.join()` — fixed
+                        // separately in recorder.rs, but this is the one
+                        // thread `spawn_meeting_detector` ever runs, so a
+                        // stop wedging here for any other reason silently
+                        // killed call detection for the rest of the day —
+                        // exactly what happened to the 2026-08-21 09:00
+                        // standup. Spawning it means a hung stop loses one
+                        // recording, never the whole detector.
+                        std::thread::spawn(move || {
+                            manager.toggle();
+                            crate::tray::update_tray_menu(
+                                &app_for_stop,
+                                &crate::tray::TrayIconState::Idle,
+                                None,
+                            );
+                        });
                     }
                 }
             }

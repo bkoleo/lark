@@ -492,6 +492,13 @@ mod tests {
     }
 }
 
+/// How often the consumer loop wakes on its own when no audio chunk has
+/// arrived, purely to give `cmd_rx` a chance. See the comment on the main
+/// `recv_timeout` below for why this exists — it is not a polling interval
+/// for anything audio-related, and 500ms is far below anything a human
+/// would notice as latency on Start/Stop.
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
 // One private consumer wired to one stream: the argument list is the wiring,
 // and bundling it into a struct would only move the same fields elsewhere.
 #[allow(clippy::too_many_arguments)]
@@ -546,10 +553,122 @@ fn run_consumer(
         }
     }
 
+    // Drains every pending command, handling Start/Stop/Take inline and
+    // reporting whether Shutdown was among them (the caller does the actual
+    // `return` — a nested fn can't return out of run_consumer for it).
+    //
+    // Pulled out so it can be called from two places: after a normal chunk
+    // arrives (the original behaviour), AND on a bare timeout tick when no
+    // chunk has arrived at all. That second call site is the actual fix —
+    // see the comment on the main loop below for the failure it closes.
+    #[allow(clippy::too_many_arguments)]
+    fn drain_commands(
+        cmd_rx: &mpsc::Receiver<Cmd>,
+        sample_rx: &mpsc::Receiver<AudioChunk>,
+        stop_flag: &Arc<AtomicBool>,
+        recording: &mut bool,
+        processed_samples: &mut Vec<f32>,
+        frame_resampler: &mut FrameResampler,
+        visualizer: &mut AudioVisualiser,
+        vad: &Option<Arc<Mutex<Box<dyn vad::VoiceActivityDetector>>>>,
+    ) -> bool {
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                Cmd::Start => {
+                    stop_flag.store(false, Ordering::Relaxed);
+                    processed_samples.clear();
+                    *recording = true;
+                    visualizer.reset();
+                    if let Some(v) = vad {
+                        v.lock().unwrap().reset();
+                    }
+                }
+                Cmd::Stop(reply_tx) => {
+                    *recording = false;
+                    stop_flag.store(true, Ordering::Relaxed);
+
+                    // Drain all remaining audio until the producer confirms end-of-stream.
+                    // The cpal callback sees the stop flag, sends EndOfStream, and goes
+                    // silent — guaranteeing every captured sample is in the channel
+                    // ahead of the sentinel. If the device has already gone fully
+                    // silent (dropped off the bus — no more chunks, no EndOfStream
+                    // either), this still bails after 2s rather than hanging; the
+                    // outer loop's own timeout (below) is what guarantees we reach
+                    // this branch at all in that case.
+                    loop {
+                        match sample_rx.recv_timeout(Duration::from_secs(2)) {
+                            Ok(AudioChunk::Samples(remaining)) => {
+                                frame_resampler.push(&remaining, &mut |frame: &[f32]| {
+                                    handle_frame(frame, true, vad, processed_samples)
+                                });
+                            }
+                            Ok(AudioChunk::EndOfStream) => break,
+                            Err(_) => {
+                                log::warn!("Timed out waiting for EndOfStream from audio callback");
+                                break;
+                            }
+                        }
+                    }
+
+                    frame_resampler.finish(&mut |frame: &[f32]| {
+                        handle_frame(frame, true, vad, processed_samples)
+                    });
+
+                    let _ = reply_tx.send(std::mem::take(processed_samples));
+
+                    // Resume the audio callback so the consumer loop can continue
+                    // receiving chunks (important for always-on microphone mode).
+                    stop_flag.store(false, Ordering::Relaxed);
+                }
+                Cmd::Take(reply_tx) => {
+                    // Hand the buffer over and carry straight on recording
+                    // into a fresh one. No stop flag, no drain: the caller is
+                    // promoting a rolling buffer, not ending a take.
+                    let _ = reply_tx.send(std::mem::take(processed_samples));
+                }
+                Cmd::Shutdown => {
+                    stop_flag.store(true, Ordering::Relaxed);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     loop {
-        let chunk = match sample_rx.recv() {
+        // `recv_timeout` rather than a blocking `recv()` — deliberately
+        // (t17873258798635ef6, 2026-08-21). A device that drops off the bus
+        // mid-recording (Bluetooth handshake failure, USB unplug) stops
+        // firing its cpal callback entirely: no more Samples, and no
+        // EndOfStream either, because the callback that would send it never
+        // runs again. A blocking `recv()` here waits on a message that is
+        // never coming, and `Cmd::Stop`/`Cmd::Shutdown` were previously only
+        // checked AFTER a chunk arrived — so the whole consumer, and with it
+        // `AudioRecorder::close()`'s unconditional `worker_handle.join()`,
+        // hung forever. That hang (not the mic error, which was already
+        // handled and logged) is what ate the 2026-08-21 09:00 standup and
+        // then killed call detection for the rest of the day, because
+        // `meeting_detect.rs` calls `toggle()` inline on its one detector
+        // thread. Waking on a timeout means `Cmd::Stop`/`Cmd::Shutdown` are
+        // always seen within `COMMAND_POLL_INTERVAL`, dead device or not.
+        let chunk = match sample_rx.recv_timeout(COMMAND_POLL_INTERVAL) {
             Ok(c) => c,
-            Err(_) => break, // stream closed
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if drain_commands(
+                    &cmd_rx,
+                    &sample_rx,
+                    &stop_flag,
+                    &mut recording,
+                    &mut processed_samples,
+                    &mut frame_resampler,
+                    &mut visualizer,
+                    &vad,
+                ) {
+                    return;
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break, // stream closed
         };
 
         let raw = match chunk {
@@ -600,61 +719,17 @@ fn run_consumer(
         }
 
         // non-blocking check for a command
-        while let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
-                Cmd::Start => {
-                    stop_flag.store(false, Ordering::Relaxed);
-                    processed_samples.clear();
-                    recording = true;
-                    visualizer.reset();
-                    if let Some(v) = &vad {
-                        v.lock().unwrap().reset();
-                    }
-                }
-                Cmd::Stop(reply_tx) => {
-                    recording = false;
-                    stop_flag.store(true, Ordering::Relaxed);
-
-                    // Drain all remaining audio until the producer confirms end-of-stream.
-                    // The cpal callback sees the stop flag, sends EndOfStream, and goes
-                    // silent — guaranteeing every captured sample is in the channel
-                    // ahead of the sentinel.
-                    loop {
-                        match sample_rx.recv_timeout(Duration::from_secs(2)) {
-                            Ok(AudioChunk::Samples(remaining)) => {
-                                frame_resampler.push(&remaining, &mut |frame: &[f32]| {
-                                    handle_frame(frame, true, &vad, &mut processed_samples)
-                                });
-                            }
-                            Ok(AudioChunk::EndOfStream) => break,
-                            Err(_) => {
-                                log::warn!("Timed out waiting for EndOfStream from audio callback");
-                                break;
-                            }
-                        }
-                    }
-
-                    frame_resampler.finish(&mut |frame: &[f32]| {
-                        handle_frame(frame, true, &vad, &mut processed_samples)
-                    });
-
-                    let _ = reply_tx.send(std::mem::take(&mut processed_samples));
-
-                    // Resume the audio callback so the consumer loop can continue
-                    // receiving chunks (important for always-on microphone mode).
-                    stop_flag.store(false, Ordering::Relaxed);
-                }
-                Cmd::Take(reply_tx) => {
-                    // Hand the buffer over and carry straight on recording
-                    // into a fresh one. No stop flag, no drain: the caller is
-                    // promoting a rolling buffer, not ending a take.
-                    let _ = reply_tx.send(std::mem::take(&mut processed_samples));
-                }
-                Cmd::Shutdown => {
-                    stop_flag.store(true, Ordering::Relaxed);
-                    return;
-                }
-            }
+        if drain_commands(
+            &cmd_rx,
+            &sample_rx,
+            &stop_flag,
+            &mut recording,
+            &mut processed_samples,
+            &mut frame_resampler,
+            &mut visualizer,
+            &vad,
+        ) {
+            return;
         }
     }
 }
