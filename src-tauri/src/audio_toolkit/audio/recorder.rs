@@ -13,7 +13,7 @@ use cpal::{
 };
 
 use crate::audio_toolkit::{
-    audio::{AudioVisualiser, FrameResampler},
+    audio::{AudioVisualiser, ChunkSink, FrameResampler},
     constants,
     vad::{self, VadFrame},
     VoiceActivityDetector,
@@ -49,6 +49,14 @@ pub struct AudioRecorder {
     vad: Option<Arc<Mutex<Box<dyn vad::VoiceActivityDetector>>>>,
     level_cb: Option<Arc<dyn Fn(Vec<f32>) + Send + Sync + 'static>>,
     flow_cb: Option<Arc<dyn Fn(f32) + Send + Sync + 'static>>,
+    /// Where recorded chunks are streamed to disk while capture runs, if
+    /// anywhere — see `ChunkSink`. `None` in the sink itself (not this
+    /// `Option`) means "nothing to write yet", checked on every chunk, so a
+    /// caller can install or remove a writer without tearing the stream
+    /// down. Cloned into the worker thread on every `open()`, so it survives
+    /// a mid-recording device restart (`close()` + `open()` on the same
+    /// `AudioRecorder`) the same way `level_cb`/`flow_cb` already do.
+    chunk_sink: Option<ChunkSink>,
     /// Rolling-buffer ceiling in samples. `usize::MAX` (the default, and
     /// what dictation and a live meeting recording both use) means keep
     /// everything; anything smaller discards the oldest audio and retains
@@ -66,6 +74,7 @@ impl AudioRecorder {
             vad: None,
             level_cb: None,
             flow_cb: None,
+            chunk_sink: None,
             sample_cap: Arc::new(AtomicUsize::new(usize::MAX)),
         })
     }
@@ -127,6 +136,17 @@ impl AudioRecorder {
         self
     }
 
+    /// Installs where this recorder streams its chunks to as it captures —
+    /// see `ChunkSink`. The sink starts with nothing installed in it
+    /// (`None`, checked per chunk by the consumer thread), so passing an
+    /// empty sink here and filling it in later is how a caller defers the
+    /// decision of *whether* to write to disk without needing to reopen the
+    /// device once it decides.
+    pub fn with_chunk_sink(mut self, sink: ChunkSink) -> Self {
+        self.chunk_sink = Some(sink);
+        self
+    }
+
     pub fn device_name(&self) -> Option<String> {
         self.device.as_ref().and_then(|d| d.name().ok())
     }
@@ -153,6 +173,7 @@ impl AudioRecorder {
         // Move the optional callbacks into the worker thread
         let level_cb = self.level_cb.clone();
         let flow_cb = self.flow_cb.clone();
+        let chunk_sink = self.chunk_sink.clone();
         let sample_cap = self.sample_cap.clone();
 
         let worker = std::thread::spawn(move || {
@@ -237,6 +258,7 @@ impl AudioRecorder {
                         cmd_rx,
                         level_cb,
                         flow_cb,
+                        chunk_sink,
                         stop_flag,
                         sample_cap,
                     );
@@ -509,6 +531,7 @@ fn run_consumer(
     cmd_rx: mpsc::Receiver<Cmd>,
     level_cb: Option<Arc<dyn Fn(Vec<f32>) + Send + Sync + 'static>>,
     flow_cb: Option<Arc<dyn Fn(f32) + Send + Sync + 'static>>,
+    chunk_sink: Option<ChunkSink>,
     stop_flag: Arc<AtomicBool>,
     sample_cap: Arc<AtomicUsize>,
 ) {
@@ -532,11 +555,32 @@ fn run_consumer(
         4000.0, // vocal_max_hz
     );
 
+    // Writes a frame to the installed streaming WAV writer, if any — the
+    // same frame being extended into `out_buf`, so the on-disk file and the
+    // in-memory buffer this task feeds Whisper from never disagree about
+    // which chunks are "the recording" (t17873258798635ef6, 2026-08-22).
+    // Locking the sink's mutex once per ~30ms frame is far below anything
+    // that matters against a 500ms command-poll interval.
+    fn write_to_sink(chunk_sink: &Option<ChunkSink>, frame: &[f32]) {
+        let Some(sink) = chunk_sink else { return };
+        // Bound to a variable rather than chained off `.lock().unwrap()`
+        // directly — the unbound form drops the MutexGuard before `writer`
+        // is used, which either fails to compile or (worse, with a
+        // differently-shaped chain) silently unlocks too early.
+        let mut guard = sink.lock().unwrap();
+        if let Some(writer) = guard.as_mut() {
+            if let Err(e) = writer.write(frame) {
+                log::warn!("Streaming WAV write failed: {e}");
+            }
+        }
+    }
+
     fn handle_frame(
         samples: &[f32],
         recording: bool,
         vad: &Option<Arc<Mutex<Box<dyn vad::VoiceActivityDetector>>>>,
         out_buf: &mut Vec<f32>,
+        chunk_sink: &Option<ChunkSink>,
     ) {
         if !recording {
             return;
@@ -545,10 +589,14 @@ fn run_consumer(
         if let Some(vad_arc) = vad {
             let mut det = vad_arc.lock().unwrap();
             match det.push_frame(samples).unwrap_or(VadFrame::Speech(samples)) {
-                VadFrame::Speech(buf) => out_buf.extend_from_slice(buf),
+                VadFrame::Speech(buf) => {
+                    write_to_sink(chunk_sink, buf);
+                    out_buf.extend_from_slice(buf);
+                }
                 VadFrame::Noise => {}
             }
         } else {
+            write_to_sink(chunk_sink, samples);
             out_buf.extend_from_slice(samples);
         }
     }
@@ -571,6 +619,7 @@ fn run_consumer(
         frame_resampler: &mut FrameResampler,
         visualizer: &mut AudioVisualiser,
         vad: &Option<Arc<Mutex<Box<dyn vad::VoiceActivityDetector>>>>,
+        chunk_sink: &Option<ChunkSink>,
     ) -> bool {
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
@@ -599,7 +648,7 @@ fn run_consumer(
                         match sample_rx.recv_timeout(Duration::from_secs(2)) {
                             Ok(AudioChunk::Samples(remaining)) => {
                                 frame_resampler.push(&remaining, &mut |frame: &[f32]| {
-                                    handle_frame(frame, true, vad, processed_samples)
+                                    handle_frame(frame, true, vad, processed_samples, chunk_sink)
                                 });
                             }
                             Ok(AudioChunk::EndOfStream) => break,
@@ -611,7 +660,7 @@ fn run_consumer(
                     }
 
                     frame_resampler.finish(&mut |frame: &[f32]| {
-                        handle_frame(frame, true, vad, processed_samples)
+                        handle_frame(frame, true, vad, processed_samples, chunk_sink)
                     });
 
                     let _ = reply_tx.send(std::mem::take(processed_samples));
@@ -663,6 +712,7 @@ fn run_consumer(
                     &mut frame_resampler,
                     &mut visualizer,
                     &vad,
+                    &chunk_sink,
                 ) {
                     return;
                 }
@@ -693,7 +743,7 @@ fn run_consumer(
 
         // ---------- existing pipeline ------------------------------------ //
         frame_resampler.push(&raw, &mut |frame: &[f32]| {
-            handle_frame(frame, recording, &vad, &mut processed_samples)
+            handle_frame(frame, recording, &vad, &mut processed_samples, &chunk_sink)
         });
 
         // ---------- rolling-buffer trim ----------------------------------- //
@@ -728,6 +778,7 @@ fn run_consumer(
             &mut frame_resampler,
             &mut visualizer,
             &vad,
+            &chunk_sink,
         ) {
             return;
         }

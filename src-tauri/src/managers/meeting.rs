@@ -25,7 +25,8 @@ use tauri_plugin_opener::OpenerExt;
 
 use crate::audio_toolkit::audio::SystemAudioTap;
 use crate::audio_toolkit::audio::{
-    list_input_devices, read_wav_samples, save_wav_file, AudioRecorder,
+    list_input_devices, read_wav_samples, save_wav_file, AudioRecorder, ChunkSink,
+    StreamingWavWriter,
 };
 use crate::helpers::clamshell;
 use crate::managers::meeting_calendar::{self, CalendarContext};
@@ -107,6 +108,21 @@ enum MeetingState {
         /// answer to "what is on now" belongs to the moment the user
         /// committed, and an unpromoted buffer has no meeting to name.
         calendar: Arc<Mutex<Option<CalendarContext>>>,
+        /// Where `mic`/`tap` stream their chunks to disk, live — empty
+        /// (`None` inside) for as long as `standby` is true, matching the
+        /// existing "nothing written during standby" rule. `start()` fills
+        /// these in immediately; `promote_standby()` fills them in at the
+        /// moment of promotion. See `ChunkSink` (t17873258798635ef6).
+        mic_sink: ChunkSink,
+        sys_sink: ChunkSink,
+        /// The provisional on-disk path each sink is streaming into, once
+        /// installed — `None` until installed, or if streaming failed to
+        /// open (disk full, permissions). `stop_and_process` finalises
+        /// these and hands them to `process()`, which renames them to the
+        /// calendar-titled final name; `None` falls back to the original
+        /// write-everything-at-the-end behaviour for that one track.
+        mic_wav_path: Option<PathBuf>,
+        sys_wav_path: Option<PathBuf>,
     },
 }
 
@@ -245,7 +261,13 @@ impl MeetingManager {
     /// ordinary recording and by standby capture, which differ only in
     /// whether the buffers are capped and whether anything is kept.
     fn open_capture(&self) -> Result<OpenCapture> {
-        let tap = SystemAudioTap::start()?;
+        // Empty — nothing is written until `start()`/`promote_standby()`
+        // installs a `StreamingWavWriter` into one, matching the existing
+        // "standby writes nothing" rule (t17873258798635ef6).
+        let mic_sink: ChunkSink = Arc::new(Mutex::new(None));
+        let sys_sink: ChunkSink = Arc::new(Mutex::new(None));
+
+        let tap = SystemAudioTap::start(sys_sink.clone())?;
 
         let capture_started = Instant::now();
         let flow_last_ms = Arc::new(AtomicU64::new(0));
@@ -259,7 +281,8 @@ impl MeetingManager {
                         Ordering::Relaxed,
                     );
                 }
-            });
+            })
+            .with_chunk_sink(mic_sink.clone());
         let resolution = self.resolve_mic_device();
         let fallback = resolution.fallback;
         let source = resolution.source;
@@ -279,7 +302,69 @@ impl MeetingManager {
             fallback,
             mic_name,
             source: source.to_string(),
+            mic_sink,
+            sys_sink,
         })
+    }
+
+    /// Opens fresh WAV files under a provisional name (before the calendar
+    /// title is known — see `process()`) and installs them into the given
+    /// sinks so the consumer threads start streaming into them immediately.
+    /// Best-effort: streaming to disk during the call is a safety net, not
+    /// a requirement — a failure here is logged and returned as `None`
+    /// rather than failing the caller, and the recording still works
+    /// exactly as it did before this task, just without the safety net for
+    /// this one call (t17873258798635ef6).
+    fn install_streaming_writers(
+        &self,
+        mic_sink: &ChunkSink,
+        sys_sink: &ChunkSink,
+        started: DateTime<Local>,
+    ) -> (Option<PathBuf>, Option<PathBuf>) {
+        let out_dir = match meetings_dir_for(&self.app_handle) {
+            Ok(dir) => dir,
+            Err(e) => {
+                log::warn!("Streaming WAV write disabled — no meetings dir: {e}");
+                return (None, None);
+            }
+        };
+        if let Err(e) = std::fs::create_dir_all(&out_dir) {
+            log::warn!("Streaming WAV write disabled — could not create meetings dir: {e}");
+            return (None, None);
+        }
+
+        // A stable name before the calendar title is known — the lookup
+        // resolves on a background thread and may still be running (see the
+        // `calendar` field). `process()` renames to the calendar-titled
+        // stem once it has one; this name is only ever seen on disk if the
+        // app dies before that rename runs.
+        let stem = format!("{} Meeting", started.format("%Y-%m-%d %H%M"));
+
+        let mic_path = out_dir.join(format!("{stem} (mic).wav"));
+        let mic_result = match StreamingWavWriter::create(&mic_path) {
+            Ok(writer) => {
+                *mic_sink.lock().unwrap() = Some(writer);
+                Some(mic_path)
+            }
+            Err(e) => {
+                log::warn!("Streaming mic WAV write disabled: {e}");
+                None
+            }
+        };
+
+        let sys_path = out_dir.join(format!("{stem} (system).wav"));
+        let sys_result = match StreamingWavWriter::create(&sys_path) {
+            Ok(writer) => {
+                *sys_sink.lock().unwrap() = Some(writer);
+                Some(sys_path)
+            }
+            Err(e) => {
+                log::warn!("Streaming system WAV write disabled: {e}");
+                None
+            }
+        };
+
+        (mic_result, sys_result)
     }
 
     fn start(self: &Arc<Self>) -> Result<()> {
@@ -310,6 +395,12 @@ impl MeetingManager {
             capture.source
         );
 
+        let started = Local::now();
+        // Start streaming to disk immediately — this is a real recording
+        // from the first sample, unlike standby (t17873258798635ef6).
+        let (mic_wav_path, sys_wav_path) =
+            self.install_streaming_writers(&capture.mic_sink, &capture.sys_sink, started);
+
         *state = MeetingState::Recording {
             standby: false,
             mic: capture.mic,
@@ -322,8 +413,12 @@ impl MeetingManager {
             restarts: 0,
             fallback,
             tap: capture.tap,
-            started: Local::now(),
+            started,
             calendar: self.spawn_calendar_lookup(),
+            mic_sink: capture.mic_sink,
+            sys_sink: capture.sys_sink,
+            mic_wav_path,
+            sys_wav_path,
         };
         drop(state);
 
@@ -414,6 +509,12 @@ impl MeetingManager {
                 tap: capture.tap,
                 started: Local::now(),
                 calendar: Arc::new(Mutex::new(None)),
+                // Nothing written yet — standby's sinks stay empty until
+                // `promote_standby` fills them in (t17873258798635ef6).
+                mic_sink: capture.mic_sink,
+                sys_sink: capture.sys_sink,
+                mic_wav_path: None,
+                sys_wav_path: None,
             };
         }
 
@@ -444,6 +545,10 @@ impl MeetingManager {
             calendar,
             fallback,
             tap,
+            mic_sink,
+            sys_sink,
+            mic_wav_path,
+            sys_wav_path,
             ..
         } = &mut *state
         else {
@@ -473,6 +578,24 @@ impl MeetingManager {
         *started = Local::now() - chrono::Duration::milliseconds((keep_secs * 1000.0) as i64);
         *standby = false;
         *calendar = self.spawn_calendar_lookup();
+
+        // Start streaming now that this is a real recording — using the
+        // backdated `started` above so the provisional filename already
+        // reflects the true start of the call. Write the promoted pre-roll
+        // as the writer's first samples before returning, so live chunks
+        // (which the consumer thread may already be delivering the instant
+        // the sink is installed) land after it rather than racing it.
+        // (t17873258798635ef6 — the on-disk gap this leaves in the rare
+        // case a chunk lands in the few instructions between `take_buffer`
+        // above and the writer install below is a documented, accepted
+        // limitation: at most a fraction of one ~30ms frame, and only the
+        // on-disk safety-net copy is affected — the in-memory transcription
+        // path via `mic_prefix`/`sys_prefix` is untouched by this.)
+        let (paths_mic, paths_sys) = self.install_streaming_writers(mic_sink, sys_sink, *started);
+        *mic_wav_path = paths_mic;
+        *sys_wav_path = paths_sys;
+        write_to_streamed_wav(mic_sink, mic_prefix, "mic (promoted pre-roll)");
+        write_to_streamed_wav(sys_sink, sys_prefix, "system (promoted pre-roll)");
         let mic_name = mic.device_name();
         let fallback = *fallback;
         // Carry the mic's *actual* state across the swap of pills. The
@@ -568,6 +691,7 @@ impl MeetingManager {
                     last_restart_ms,
                     restarts,
                     fallback,
+                    mic_sink,
                     ..
                 } = &mut *state
                 else {
@@ -630,6 +754,7 @@ impl MeetingManager {
                             standby,
                             partial,
                             mic_prefix,
+                            mic_sink,
                             audio_started,
                             "a device switch",
                         );
@@ -693,6 +818,7 @@ impl MeetingManager {
                     standby,
                     partial,
                     mic_prefix,
+                    mic_sink,
                     audio_started,
                     "a silent stream",
                 );
@@ -736,7 +862,20 @@ impl MeetingManager {
     }
 
     fn stop_and_process(self: &Arc<Self>) {
-        let (mut mic, mic_prefix, sys_prefix, audio_started, restarts, tap, started, calendar) = {
+        let (
+            mut mic,
+            mic_prefix,
+            sys_prefix,
+            audio_started,
+            restarts,
+            tap,
+            started,
+            calendar,
+            mic_sink,
+            sys_sink,
+            mic_wav_path,
+            sys_wav_path,
+        ) = {
             let mut state = self.state.lock().unwrap();
             match std::mem::replace(&mut *state, MeetingState::Idle) {
                 // Standby is not a recording and cannot be stopped into one:
@@ -751,6 +890,10 @@ impl MeetingManager {
                     tap,
                     started,
                     calendar,
+                    mic_sink,
+                    sys_sink,
+                    mic_wav_path,
+                    sys_wav_path,
                     ..
                 } => (
                     mic,
@@ -761,6 +904,10 @@ impl MeetingManager {
                     tap,
                     started,
                     calendar,
+                    mic_sink,
+                    sys_sink,
+                    mic_wav_path,
+                    sys_wav_path,
                 ),
                 other => {
                     *state = other;
@@ -774,6 +921,18 @@ impl MeetingManager {
         // with it.
         *self.manual_mic.lock().unwrap() = None;
         crate::overlay::hide_meeting_prompt(&self.app_handle);
+
+        // Finalise the streamed WAVs BEFORE calling mic.stop()/tap.stop() —
+        // those are exactly the calls that hung forever on 2026-08-21 when
+        // a device dropped off the bus mid-call (t17873258798635ef6). Taking
+        // the writer out of its sink is safe to do concurrently with the
+        // consumer thread that feeds it: the mutex means it either sees the
+        // writer for one more chunk, or sees it already gone and simply
+        // stops writing — never a torn write either way. So even if
+        // everything below this line hangs forever, the file already on
+        // disk is valid and holds the audio up to this exact moment.
+        let mic_wav_path = finalize_streamed_wav(&mic_sink, mic_wav_path, "mic");
+        let sys_wav_path = finalize_streamed_wav(&sys_sink, sys_wav_path, "system");
 
         let mut mic_samples = mic_prefix;
         match mic.stop() {
@@ -821,7 +980,14 @@ impl MeetingManager {
             // Cloned before `process()` takes ownership — the "saved" card
             // below wants the same title, not a re-derived one.
             let saved_title = calendar.as_ref().and_then(|c| c.title.clone());
-            let result = manager.process(mic_samples, sys_samples, started, calendar);
+            let result = manager.process(
+                mic_samples,
+                sys_samples,
+                started,
+                calendar,
+                mic_wav_path,
+                sys_wav_path,
+            );
             drop(_guard);
             // A new recording may have started while this one transcribed —
             // only reset the tray when nothing is live.
@@ -924,7 +1090,7 @@ impl MeetingManager {
         let manager = self.clone();
         std::thread::spawn(move || {
             let _guard = ProcessingGuard(&manager.processing);
-            let result = manager.process(mic_samples, sys_samples, started, None);
+            let result = manager.process(mic_samples, sys_samples, started, None, None, None);
             drop(_guard);
             if manager.status() != MeetingStatus::Recording {
                 crate::tray::update_tray_menu(
@@ -947,6 +1113,8 @@ impl MeetingManager {
         sys_samples: Vec<f32>,
         started: DateTime<Local>,
         calendar: Option<CalendarContext>,
+        mic_wav_path: Option<PathBuf>,
+        sys_wav_path: Option<PathBuf>,
     ) -> Result<PathBuf> {
         let out_dir = meetings_dir_for(&self.app_handle)?;
         std::fs::create_dir_all(&out_dir)?;
@@ -964,13 +1132,28 @@ impl MeetingManager {
 
         cleanup_old_meeting_wavs(&out_dir);
 
-        // Keep the raw tracks next to the transcript while meeting mode is a
-        // spike — lets us debug a bad transcript by listening back.
+        // The tracks were streamed to disk live and finalised in
+        // `stop_and_process` — get them into place by renaming to the now-
+        // known calendar-titled stem, and only fall back to writing them
+        // from the in-memory buffer (the original, at-risk behaviour) if
+        // streaming produced nothing usable for that track
+        // (t17873258798635ef6). Either way the file that ends up at this
+        // path is what the transcript and the recovery CLI point to.
         if !mic_samples.is_empty() {
-            let _ = save_wav_file(out_dir.join(format!("{stem} (mic).wav")), &mic_samples);
+            finish_meeting_wav(
+                &out_dir.join(format!("{stem} (mic).wav")),
+                mic_wav_path.as_deref(),
+                &mic_samples,
+                "mic",
+            );
         }
         if !sys_samples.is_empty() {
-            let _ = save_wav_file(out_dir.join(format!("{stem} (system).wav")), &sys_samples);
+            finish_meeting_wav(
+                &out_dir.join(format!("{stem} (system).wav")),
+                sys_wav_path.as_deref(),
+                &sys_samples,
+                "system",
+            );
         }
 
         // The model loads lazily for dictation because the hotkey press
@@ -1341,6 +1524,14 @@ struct OpenCapture {
     fallback: bool,
     mic_name: String,
     source: String,
+    /// Empty sinks (nothing installed) wired into `mic`/`tap` at
+    /// construction — standby capture leaves them empty for as long as it
+    /// stays standby; `start()` and `promote_standby()` install a writer
+    /// into them the moment there is a real recording to write
+    /// (t17873258798635ef6). Kept as their own fields rather than reached
+    /// through `mic`/`tap` because `SystemAudioTap` doesn't expose its copy.
+    mic_sink: ChunkSink,
+    sys_sink: ChunkSink,
 }
 
 /// The rewind window in seconds, clamped to something an 8 GB machine can
@@ -1411,6 +1602,7 @@ fn salvage_partial(
     standby: bool,
     partial: Vec<f32>,
     mic_prefix: &mut Vec<f32>,
+    mic_sink: &ChunkSink,
     audio_started: &Instant,
     reason: &str,
 ) {
@@ -1423,9 +1615,97 @@ fn salvage_partial(
         }
         return;
     }
+    // The dying stream's last samples were never seen by `handle_frame`'s
+    // chunk sink (they're arriving here via `take_buffer`/`stop`, not the
+    // consumer thread's normal per-frame path), so they have to be streamed
+    // explicitly — otherwise every restart this watchdog performs (a common
+    // path: it's the same recovery a silent AirPods handshake triggers)
+    // opens a gap in the on-disk file (t17873258798635ef6).
+    write_to_streamed_wav(mic_sink, &partial, "mic (restart salvage)");
     mic_prefix.extend(partial);
+    let before = mic_prefix.len();
     let expected = (audio_started.elapsed().as_secs_f64() * SAMPLE_RATE as f64) as usize;
     fit_to_length(mic_prefix, expected);
+    // `fit_to_length` only ever grows the track here — wall-clock can't run
+    // behind a live capture at the moment of a restart — but guard the
+    // subtraction anyway rather than assume it. The appended tail is
+    // silence closing the restart gap; without also disk-writing it, the
+    // streamed file drifts out of sync with the very thing this restart is
+    // correcting, one restart at a time.
+    if expected > before {
+        let gap = vec![0.0_f32; expected - before];
+        write_to_streamed_wav(mic_sink, &gap, "mic (restart gap padding)");
+    }
+}
+
+/// Writes `samples` to the sink's writer if one is installed, or does
+/// nothing (streaming is a best-effort safety net — see `ChunkSink`).
+/// Shared by every write site outside the consumer threads themselves
+/// (`recorder.rs`/`system_tap.rs` each have their own copy of this same
+/// lock-and-write shape, since they can't depend on `meeting.rs`).
+fn write_to_streamed_wav(sink: &ChunkSink, samples: &[f32], label: &str) {
+    if samples.is_empty() {
+        return;
+    }
+    let mut guard = sink.lock().unwrap();
+    if let Some(writer) = guard.as_mut() {
+        if let Err(e) = writer.write(samples) {
+            log::warn!("Streaming WAV write failed ({label}): {e}");
+        }
+    }
+}
+
+/// Takes the writer out of `sink` (if any) and finalises it — writes the
+/// real WAV header/size, without which the file is not a valid WAV a reader
+/// can open. Returns `path` unchanged on success, so the caller can pass it
+/// on to `process()` for the rename to the calendar-titled final name;
+/// returns `None` on any failure (no writer was ever installed, or
+/// `finalize()` itself errored), which is `process()`'s existing signal to
+/// fall back to writing the WAV from the in-memory buffer the way this
+/// task originally worked (t17873258798635ef6).
+fn finalize_streamed_wav(sink: &ChunkSink, path: Option<PathBuf>, label: &str) -> Option<PathBuf> {
+    let writer = sink.lock().unwrap().take()?;
+    match writer.finalize() {
+        Ok(()) => path,
+        Err(e) => {
+            log::warn!("Failed to finalise the streamed {label} WAV: {e}");
+            None
+        }
+    }
+}
+
+/// Gets the final `(mic|system).wav` into place at `final_path`. The common
+/// case is a rename: `streamed` already holds the whole track, written live
+/// and finalised in `stop_and_process`, just under its provisional
+/// pre-calendar name — renaming it is what this task exists to make
+/// possible, since it means the file was safe on disk the whole time the
+/// recording ran, not only after a `save_wav_file` call that could hang or
+/// never run. Falls back to writing `samples` in one go — the original,
+/// at-risk behaviour this task is closing — if there is no streamed file
+/// (streaming never opened one, e.g. disk full) or the rename fails
+/// (t17873258798635ef6).
+fn finish_meeting_wav(
+    final_path: &std::path::Path,
+    streamed: Option<&std::path::Path>,
+    samples: &[f32],
+    label: &str,
+) {
+    if let Some(streamed) = streamed {
+        if streamed == final_path {
+            // Already at the final name — the calendar title never
+            // resolved past the "Meeting" fallback both names share.
+            return;
+        }
+        if streamed.exists() {
+            match std::fs::rename(streamed, final_path) {
+                Ok(()) => return,
+                Err(e) => log::warn!(
+                    "Could not rename the streamed {label} WAV, rewriting from memory instead: {e}"
+                ),
+            }
+        }
+    }
+    let _ = save_wav_file(final_path, samples);
 }
 
 /// One JSON object per line, flushed immediately. Deliberately dependency-free

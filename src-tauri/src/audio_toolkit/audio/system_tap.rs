@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 
-use crate::audio_toolkit::audio::FrameResampler;
+use crate::audio_toolkit::audio::{ChunkSink, FrameResampler};
 use crate::audio_toolkit::constants;
 
 use cidre::core_audio::aggregate_device_keys as agg_keys;
@@ -44,6 +44,13 @@ pub struct SystemAudioTap {
     /// Shared with the consumer thread so the buffer can be capped, read or
     /// taken while capture continues.
     accumulated: Arc<Mutex<Vec<f32>>>,
+    /// Where captured chunks are also streamed to disk while capture runs,
+    /// if a caller has installed a writer — see `ChunkSink` and the matching
+    /// field on `AudioRecorder`. Kept on `self` only so it can be handed
+    /// back if this struct ever grows a way to swap it after `start()`;
+    /// today the consumer thread owns the only live clone.
+    #[allow(dead_code)]
+    chunk_sink: ChunkSink,
     /// `usize::MAX` = keep everything (a real recording); smaller = keep only
     /// the most recent window (standby capture waiting to be promoted).
     sample_cap: Arc<AtomicUsize>,
@@ -54,8 +61,12 @@ pub struct SystemAudioTap {
 unsafe impl Send for SystemAudioTap {}
 
 impl SystemAudioTap {
-    /// Creates the process tap + private aggregate device and starts capture.
-    pub fn start() -> Result<Self> {
+    /// Creates the process tap + private aggregate device and starts
+    /// capture. `chunk_sink` starts with nothing installed in it — pass an
+    /// empty `Arc::new(Mutex::new(None))` when the caller hasn't decided
+    /// whether to stream to disk yet (standby capture), or one already
+    /// carrying a `StreamingWavWriter` to start streaming immediately.
+    pub fn start(chunk_sink: ChunkSink) -> Result<Self> {
         let tap_desc = ca::TapDesc::with_mono_global_tap_excluding_processes(&ns::Array::new());
         let tap = tap_desc
             .create_process_tap()
@@ -151,6 +162,7 @@ impl SystemAudioTap {
         let sample_cap = Arc::new(AtomicUsize::new(usize::MAX));
         let sink = accumulated.clone();
         let cap = sample_cap.clone();
+        let chunk_sink_for_consumer = chunk_sink.clone();
         let consumer = std::thread::spawn(move || {
             let mut resampler = FrameResampler::new(
                 sample_rate as usize,
@@ -159,7 +171,17 @@ impl SystemAudioTap {
             );
             while let Ok(chunk) = rx.recv() {
                 let mut buf = sink.lock().unwrap();
-                resampler.push(&chunk, &mut |frame: &[f32]| buf.extend_from_slice(frame));
+                resampler.push(&chunk, &mut |frame: &[f32]| {
+                    buf.extend_from_slice(frame);
+                    // Same frame, same moment — see the matching comment in
+                    // recorder.rs's `write_to_sink` (t17873258798635ef6).
+                    let mut writer_guard = chunk_sink_for_consumer.lock().unwrap();
+                    if let Some(writer) = writer_guard.as_mut() {
+                        if let Err(e) = writer.write(frame) {
+                            log::warn!("Streaming WAV write failed (system): {e}");
+                        }
+                    }
+                });
                 let cap = cap.load(Ordering::Relaxed);
                 if cap != usize::MAX {
                     // Reserve the whole window up front rather than letting
@@ -180,7 +202,15 @@ impl SystemAudioTap {
                 }
             }
             let mut buf = sink.lock().unwrap();
-            resampler.finish(&mut |frame: &[f32]| buf.extend_from_slice(frame));
+            resampler.finish(&mut |frame: &[f32]| {
+                buf.extend_from_slice(frame);
+                let mut writer_guard = chunk_sink_for_consumer.lock().unwrap();
+                if let Some(writer) = writer_guard.as_mut() {
+                    if let Err(e) = writer.write(frame) {
+                        log::warn!("Streaming WAV write failed (system, final flush): {e}");
+                    }
+                }
+            });
         });
 
         Ok(Self {
@@ -189,6 +219,7 @@ impl SystemAudioTap {
             ctx: Some(ctx),
             consumer: Some(consumer),
             accumulated,
+            chunk_sink,
             sample_cap,
         })
     }
