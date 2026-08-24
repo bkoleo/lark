@@ -613,6 +613,8 @@
     "pasteFailed": "Text could not be pasted into the active application.",
     "transcriptionTimeoutTitle": "Transcription Timed Out",
     "transcriptionTimeout": "That recording took too long to transcribe and was stopped. Your audio was saved — try again, or free up disk space if this keeps happening.",
+    "transcriptionFailedTitle": "Transcription Failed",
+    "transcriptionFailed": "That recording couldn't be transcribed, so nothing was pasted. Your audio was saved and will be recovered the next time Lark starts.",
     "lowDiskTitle": "Low Disk Space",
     "lowDisk": "Only {{freeMb}} MB free. Transcription can stall when the disk is this full — free up some space."
   },

@@ -78,6 +78,12 @@ pub struct TranscriptionManager {
     watcher_handle: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
     is_loading: Arc<Mutex<bool>>,
     loading_condvar: Arc<Condvar>,
+    /// True while a transcription has the engine checked out of `engine`.
+    /// `engine` being `None` means "busy" when this is set and "unloaded" when
+    /// it isn't — see [`Self::acquire_engine`] for why that distinction matters.
+    engine_checked_out: Arc<AtomicBool>,
+    /// Signalled whenever a checked-out engine is returned or dropped.
+    engine_available: Arc<Condvar>,
 }
 
 impl TranscriptionManager {
@@ -92,6 +98,8 @@ impl TranscriptionManager {
             watcher_handle: Arc::new(Mutex::new(None)),
             is_loading: Arc::new(Mutex::new(false)),
             loading_condvar: Arc::new(Condvar::new()),
+            engine_checked_out: Arc::new(AtomicBool::new(false)),
+            engine_available: Arc::new(Condvar::new()),
         };
 
         // Start the idle watcher
@@ -197,7 +205,101 @@ impl TranscriptionManager {
         })
     }
 
+    /// Take ownership of the loaded engine for one transcription.
+    ///
+    /// `engine` holding `None` has two very different meanings and the caller
+    /// must not conflate them: another transcription may have it checked out
+    /// (wait for it to come back), or nothing has loaded it yet (load it).
+    /// Until 2026-08-24 both read as "Model is not loaded for transcription."
+    /// and returned instantly, so pressing the dictation hotkey while a
+    /// meeting's batch pass held the engine failed on the spot and left a
+    /// silent empty history row that looked exactly like a dead microphone.
+    fn acquire_engine(&self, model_id: &str) -> Result<LoadedEngine> {
+        // A load can fail, or be undone by the idle watcher between attempts,
+        // so bound the retries — this must never spin forever.
+        for _ in 0..3 {
+            // Wait out any in-flight model load first.
+            {
+                let mut is_loading = self.is_loading.lock().unwrap_or_else(|e| e.into_inner());
+                while *is_loading {
+                    is_loading = self
+                        .loading_condvar
+                        .wait(is_loading)
+                        .unwrap_or_else(|e| e.into_inner());
+                }
+            }
+
+            {
+                let mut engine_guard = self.lock_engine();
+                loop {
+                    if let Some(engine) = engine_guard.take() {
+                        self.engine_checked_out.store(true, Ordering::SeqCst);
+                        return Ok(engine);
+                    }
+                    if !self.engine_checked_out.load(Ordering::SeqCst) {
+                        break; // genuinely unloaded — load it below
+                    }
+                    debug!("Engine is busy with another transcription; waiting for it");
+                    engine_guard = self
+                        .engine_available
+                        .wait(engine_guard)
+                        .unwrap_or_else(|e| e.into_inner());
+                }
+            }
+
+            // Nothing loaded at all — load it rather than failing the take.
+            match self.try_start_loading() {
+                Some(_loading_guard) => {
+                    info!(
+                        "Transcription requested with no model loaded; loading {} now",
+                        model_id
+                    );
+                    if let Err(e) = self.load_model(model_id) {
+                        return Err(anyhow::anyhow!(
+                            "Failed to load transcription model {}: {}",
+                            model_id,
+                            e
+                        ));
+                    }
+                }
+                None => {
+                    // Another thread just started loading; the next pass waits on it.
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!("Model is not loaded for transcription."))
+    }
+
+    /// Return a checked-out engine and wake anything waiting for it.
+    fn release_engine(&self, engine: LoadedEngine) {
+        {
+            let mut engine_guard = self.lock_engine();
+            *engine_guard = Some(engine);
+            self.engine_checked_out.store(false, Ordering::SeqCst);
+        }
+        self.engine_available.notify_all();
+    }
+
+    /// Mark a checked-out engine as gone (it panicked and was dropped) so that
+    /// waiters stop waiting and fall through to loading a fresh one.
+    fn release_engine_dropped(&self) {
+        {
+            let _engine_guard = self.lock_engine();
+            self.engine_checked_out.store(false, Ordering::SeqCst);
+        }
+        self.engine_available.notify_all();
+    }
+
     pub fn unload_model(&self) -> Result<()> {
+        // Unloading while a transcription owns the engine would clear
+        // `current_model_id` under it and leave the two out of step when it is
+        // handed back. Leave it be; the next idle tick will pick it up.
+        if self.engine_checked_out.load(Ordering::SeqCst) {
+            debug!("Skipping unload — a transcription currently holds the engine");
+            return Ok(());
+        }
+
         let unload_start = std::time::Instant::now();
         debug!("Starting to unload model");
 
@@ -464,20 +566,6 @@ impl TranscriptionManager {
             return Ok(String::new());
         }
 
-        // Check if model is loaded, if not try to load it
-        {
-            // If the model is loading, wait for it to complete.
-            let mut is_loading = self.is_loading.lock().unwrap();
-            while *is_loading {
-                is_loading = self.loading_condvar.wait(is_loading).unwrap();
-            }
-
-            let engine_guard = self.lock_engine();
-            if engine_guard.is_none() {
-                return Err(anyhow::anyhow!("Model is not loaded for transcription."));
-            }
-        }
-
         // Get current settings for configuration
         let settings = get_settings(&self.app_handle);
 
@@ -512,22 +600,12 @@ impl TranscriptionManager {
         // We use catch_unwind to prevent engine panics from poisoning the mutex,
         // which would make the app hang indefinitely on subsequent operations.
         let result = {
-            let mut engine_guard = self.lock_engine();
-
-            // Take the engine out so we own it during transcription.
-            // If the engine panics, we simply don't put it back (effectively unloading it)
-            // instead of poisoning the mutex.
-            let mut engine = match engine_guard.take() {
-                Some(e) => e,
-                None => {
-                    return Err(anyhow::anyhow!(
-                        "Model failed to load after auto-load attempt. Please check your model settings."
-                    ));
-                }
-            };
-
-            // Release the lock before transcribing — no mutex held during the engine call
-            drop(engine_guard);
+            // Take the engine out so we own it during transcription: this waits
+            // if another transcription (a meeting's batch pass, say) currently
+            // holds it, and lazy-loads if nothing has loaded it yet. No mutex is
+            // held during the engine call itself. If the engine panics we simply
+            // don't put it back, instead of poisoning the mutex.
+            let mut engine = self.acquire_engine(&settings.selected_model)?;
 
             let transcribe_result = catch_unwind(AssertUnwindSafe(
                 || -> Result<transcribe_rs::TranscriptionResult> {
@@ -641,14 +719,17 @@ impl TranscriptionManager {
 
             match transcribe_result {
                 Ok(inner_result) => {
-                    // Success or normal error — put the engine back
-                    let mut engine_guard = self.lock_engine();
-                    *engine_guard = Some(engine);
+                    // Success or normal error — put the engine back and wake
+                    // anything that is waiting its turn for it.
+                    self.release_engine(engine);
                     inner_result?
                 }
                 Err(panic_payload) => {
                     // Engine panicked — do NOT put it back (it's in an unknown state).
-                    // The engine is dropped here, effectively unloading it.
+                    // The engine is dropped here, effectively unloading it. Clear the
+                    // checked-out flag first or every waiter would block forever.
+                    drop(engine);
+                    self.release_engine_dropped();
                     let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
                         s.to_string()
                     } else if let Some(s) = panic_payload.downcast_ref::<String>() {

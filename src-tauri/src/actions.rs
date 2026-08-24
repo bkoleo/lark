@@ -809,7 +809,7 @@ impl ShortcutAction for TranscribeAction {
                             if is_timeout {
                                 warn!("Transcription aborted (timeout); notifying user, WAV retained for recovery");
                             } else {
-                                debug!("Global Shortcut Transcription error: {}", err);
+                                error!("Global Shortcut Transcription error: {}", err);
                             }
                             // Save entry with empty text so the user can retry and
                             // startup recovery can find the WAV.
@@ -824,18 +824,28 @@ impl ShortcutAction for TranscribeAction {
                                     error!("Failed to save failed history entry: {}", save_err);
                                 }
                             }
-                            if is_timeout {
-                                // Reuse the recording-error toast pipeline (works in
-                                // release builds — no new typed command/binding).
-                                let _ = ah.emit(
-                                    "recording-error",
-                                    RecordingErrorEvent {
-                                        error_type: "transcription_timeout".to_string(),
-                                        detail: None,
+                            // Always tell the user. A transcription that fails
+                            // with no toast is indistinguishable from Lark never
+                            // hearing him, and the empty history row it leaves
+                            // reads as a dead microphone (2026-08-24).
+                            // Reuse the recording-error toast pipeline (works in
+                            // release builds — no new typed command/binding).
+                            let _ = ah.emit(
+                                "recording-error",
+                                RecordingErrorEvent {
+                                    error_type: if is_timeout {
+                                        "transcription_timeout".to_string()
+                                    } else {
+                                        "transcription_failed".to_string()
                                     },
-                                );
-                                play_feedback_sound(&ah, SoundType::Stop);
-                            }
+                                    detail: if is_timeout {
+                                        None
+                                    } else {
+                                        Some(err.to_string())
+                                    },
+                                },
+                            );
+                            play_feedback_sound(&ah, SoundType::Stop);
                             utils::hide_recording_overlay(&ah);
                             change_tray_icon(&ah, TrayIconState::Idle);
                         }

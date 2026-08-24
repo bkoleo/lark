@@ -115,6 +115,11 @@ function App() {
         toast.error(t("errors.transcriptionTimeoutTitle"), {
           description: t("errors.transcriptionTimeout"),
         });
+      } else if (error_type === "transcription_failed") {
+        toast.error(t("errors.transcriptionFailedTitle"), {
+          description: t("errors.transcriptionFailed"),
+          duration: 10000,
+        });
       } else {
         toast.error(
           t("errors.recordingFailed", { error: detail ?? "Unknown error" }),
