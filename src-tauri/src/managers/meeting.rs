@@ -1367,9 +1367,25 @@ Transcript:\n{}",
 
         // `process()` runs on a plain worker thread, so drive the async call
         // to completion here rather than leaking async up the call chain.
+        //
+        // Two arguments here are load-bearing and were both missing until 2026-09-27.
+        // `reasoning_effort: "none"` — the configured model is a reasoning model, and
+        // left to itself it spends thousands of reasoning tokens before it writes a
+        // word of summary. Measured on the 2026-09-21 standup transcript: 54.6s with
+        // reasoning on, 9.3s with it off, and the shorter answer was the better one.
+        // `send_chat_completion_batch` — nothing is waiting on this, and the prompt is
+        // a whole transcript, so it gets the batch time budget rather than the
+        // interactive one that the dictation path needs.
         let result = tauri::async_runtime::block_on(async move {
-            crate::llm_client::send_chat_completion(&provider, api_key, &model, prompt, None, None)
-                .await
+            crate::llm_client::send_chat_completion_batch(
+                &provider,
+                api_key,
+                &model,
+                prompt,
+                Some("none".to_string()),
+                None,
+            )
+            .await
         })
         .map_err(|e| anyhow!(e))?;
 

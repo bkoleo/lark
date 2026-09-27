@@ -5,13 +5,48 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 
-/// Both meeting-notes summaries and dictation post-process cleanups go through this
-/// client. 60s covers a real DeepSeek round trip (a short meeting summary is ~530
-/// tokens) with room for a long dictation cleanup, while still capping a hung request
-/// well under the meeting flow's own processing-window expectations. A failed call
-/// (timeout included) is handled by the caller: meeting_notes writes the error into
-/// the transcript's Notes section rather than losing the transcript.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Two workloads share this client and they do NOT share a time budget, which is why
+/// there are two constants rather than one.
+///
+/// **Interactive** (dictation post-process, model listing): the user is waiting, so a
+/// slow call is worse than a failed one. 60s caps a hung request.
+///
+/// **Batch** (meeting notes): nobody is waiting — the recording has already stopped and
+/// the transcript is safe on disk. The prompt is the whole transcript, up to
+/// `meeting_notes_max_chars`, so this is an order of magnitude more work than a
+/// dictation cleanup and its budget has to say so.
+///
+/// One constant for both is what broke meeting notes from 2026-09-14 to 2026-09-27.
+/// The 60s was sized for DeepSeek's non-reasoning chat model ("a short meeting summary
+/// is ~530 tokens"); the 09-14 move to the Nous Portal pointed the same call at
+/// `deepseek/deepseek-v4.1-flash`, a REASONING model, and nothing revisited the number.
+/// A real 8.5k-token standup transcript measured 54.6s against the 60s ceiling, so six
+/// of the next eight meetings timed out and two squeaked through — which is exactly why
+/// it read as intermittent network trouble rather than as a ceiling.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+pub const BATCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// reqwest nests the real cause — "operation timed out", "connection refused", a TLS
+/// fault — in the error's `source()` chain, and `{}` on the outer error prints none of
+/// it. So a plain `format!("{e}")` on a send failure yields exactly
+/// "error sending request for url (…)": the URL we already knew, and no cause.
+///
+/// That one formatting choice cost eleven days. Six meeting summaries failed with that
+/// text, three different agents read it and each guessed at the vendor being down,
+/// rate-limited or holding a dead key, and the answer — a client-side timeout — was in
+/// the source chain being thrown away. Walk the chain so the next failure names itself.
+fn describe_request_error(e: &reqwest::Error) -> String {
+    let mut parts = vec![e.to_string()];
+    let mut src = std::error::Error::source(e);
+    while let Some(cause) = src {
+        parts.push(cause.to_string());
+        src = cause.source();
+    }
+    if e.is_timeout() {
+        parts.push("(client-side timeout, not a server response)".to_string());
+    }
+    parts.join(": ")
+}
 
 #[derive(Debug, Serialize)]
 struct ChatMessage {
@@ -106,11 +141,15 @@ fn build_headers(provider: &PostProcessProvider, api_key: &str) -> Result<Header
 }
 
 /// Create an HTTP client with provider-specific headers
-fn create_client(provider: &PostProcessProvider, api_key: &str) -> Result<reqwest::Client, String> {
+fn create_client(
+    provider: &PostProcessProvider,
+    api_key: &str,
+    timeout: Duration,
+) -> Result<reqwest::Client, String> {
     let headers = build_headers(provider, api_key)?;
     reqwest::Client::builder()
         .default_headers(headers)
-        .timeout(REQUEST_TIMEOUT)
+        .timeout(timeout)
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))
 }
@@ -135,6 +174,34 @@ pub async fn send_chat_completion(
         None,
         reasoning_effort,
         reasoning,
+        REQUEST_TIMEOUT,
+    )
+    .await
+}
+
+/// The batch sibling of `send_chat_completion`: same request, `BATCH_REQUEST_TIMEOUT`.
+/// Use it when nothing is waiting on the answer and the prompt is large — meeting
+/// notes, whose prompt is a whole transcript. Named rather than parameterised at the
+/// call site on purpose: the previous code made every caller inherit one budget
+/// silently, and the silence is what hid the bug.
+pub async fn send_chat_completion_batch(
+    provider: &PostProcessProvider,
+    api_key: String,
+    model: &str,
+    prompt: String,
+    reasoning_effort: Option<String>,
+    reasoning: Option<ReasoningConfig>,
+) -> Result<Option<String>, String> {
+    send_chat_completion_with_schema(
+        provider,
+        api_key,
+        model,
+        prompt,
+        None,
+        None,
+        reasoning_effort,
+        reasoning,
+        BATCH_REQUEST_TIMEOUT,
     )
     .await
 }
@@ -153,13 +220,18 @@ pub async fn send_chat_completion_with_schema(
     json_schema: Option<Value>,
     reasoning_effort: Option<String>,
     reasoning: Option<ReasoningConfig>,
+    timeout: Duration,
 ) -> Result<Option<String>, String> {
     let base_url = provider.base_url.trim_end_matches('/');
     let url = format!("{}/chat/completions", base_url);
 
-    debug!("Sending chat completion request to: {}", url);
+    debug!(
+        "Sending chat completion request to: {} (timeout {}s)",
+        url,
+        timeout.as_secs()
+    );
 
-    let client = create_client(provider, &api_key)?;
+    let client = create_client(provider, &api_key, timeout)?;
 
     // Build messages vector
     let mut messages = Vec::new();
@@ -201,7 +273,7 @@ pub async fn send_chat_completion_with_schema(
         .json(&request_body)
         .send()
         .await
-        .map_err(|e| format!("HTTP request failed: {}", e))?;
+        .map_err(|e| format!("HTTP request failed: {}", describe_request_error(&e)))?;
 
     let status = response.status();
     if !status.is_success() {
@@ -237,13 +309,13 @@ pub async fn fetch_models(
 
     debug!("Fetching models from: {}", url);
 
-    let client = create_client(provider, &api_key)?;
+    let client = create_client(provider, &api_key, REQUEST_TIMEOUT)?;
 
     let response = client
         .get(&url)
         .send()
         .await
-        .map_err(|e| format!("Failed to fetch models: {}", e))?;
+        .map_err(|e| format!("Failed to fetch models: {}", describe_request_error(&e)))?;
 
     let status = response.status();
     if !status.is_success() {

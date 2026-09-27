@@ -330,6 +330,7 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
             Some(json_schema),
             reasoning_effort.clone(),
             reasoning.clone(),
+            crate::llm_client::REQUEST_TIMEOUT,
         )
         .await
         {
