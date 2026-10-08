@@ -1202,6 +1202,20 @@ impl MeetingManager {
 
             let mic_path = locate_track(&dir, marker.mic_wav.as_deref(), &prefix, "mic");
             let sys_path = locate_track(&dir, marker.sys_wav.as_deref(), &prefix, "system");
+            // The hole: from the last write (the header is refreshed every
+            // second, so ≤1s before the death) to now. Measured BEFORE the
+            // header repair below, which rewrites the file and would move its
+            // mtime to now — the 2026-10-08 drill read a 0s hole for an 8s
+            // death that way. Filled with silence if the recording resumes,
+            // so the timestamps on both sides of it stay true.
+            let newest_write = [&mic_path, &sys_path]
+                .into_iter()
+                .flatten()
+                .filter_map(|p| std::fs::metadata(p).ok()?.modified().ok())
+                .max();
+            let gap = newest_write
+                .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+                .unwrap_or(RESUME_GAP_MAX + Duration::from_secs(1));
             for (path, label) in [(&mic_path, "mic"), (&sys_path, "system")] {
                 let Some(path) = path else { continue };
                 match repair_wav_header(path) {
@@ -1237,17 +1251,6 @@ impl MeetingManager {
                 continue;
             }
 
-            // The hole: from the last header refresh (≤1s before the death)
-            // to now. Filled with silence if the recording resumes, so the
-            // timestamps on both sides of it stay true.
-            let newest_write = [&mic_path, &sys_path]
-                .into_iter()
-                .flatten()
-                .filter_map(|p| std::fs::metadata(p).ok()?.modified().ok())
-                .max();
-            let gap = newest_write
-                .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
-                .unwrap_or(RESUME_GAP_MAX + Duration::from_secs(1));
             let call_live = crate::managers::meeting_detect::call_mic(own_pid as i32).is_some();
             let alerted_flag = recording_guard::alerted_path(&marker_path);
             let already_alerted = alerted_flag.exists();
