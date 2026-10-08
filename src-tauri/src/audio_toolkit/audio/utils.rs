@@ -82,9 +82,26 @@ pub type ChunkSink = Arc<Mutex<Option<StreamingWavWriter>>>;
 /// first thing after a stop is requested — before touching anything that
 /// might hang (see `MeetingManager::stop_and_process`) — rather than
 /// relying on `Drop` to eventually run.
+///
+/// Neither `Drop` nor an explicit finalise runs when the process is simply
+/// gone — SIGKILL, a jetsam, or (2026-10-08) a Quit Apple Event from the
+/// Dock that AppKit turned into `exit(0)` with no Rust unwinding at all.
+/// That left two 27 MB files whose RIFF and data sizes both read 0, and the
+/// audio had to be recovered by hand. So the writer now checkpoints itself:
+/// at most once a second `write()` rewrites the header to the true size
+/// (`hound::WavWriter::flush`), so the file on disk is a valid WAV at every
+/// moment, a second of audio behind at worst. `repair_wav_header` closes
+/// even that gap at the next launch.
 pub struct StreamingWavWriter {
     writer: WavWriter<BufWriter<File>>,
+    last_checkpoint: std::time::Instant,
+    checkpoint_every: std::time::Duration,
 }
+
+/// How often `write()` rewrites the header. One second: a 16 kHz mono i16
+/// stream is 32 KB/s, so a checkpoint is a 44-byte seek-and-write per
+/// 32 KB appended — unmeasurable against the audio itself.
+const WAV_CHECKPOINT_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl StreamingWavWriter {
     /// Creates (or truncates) a 16kHz mono 16-bit WAV file for incremental
@@ -98,28 +115,42 @@ impl StreamingWavWriter {
             sample_format: hound::SampleFormat::Int,
         };
         let writer = WavWriter::create(file_path.as_ref(), spec)?;
-        Ok(Self { writer })
+        Ok(Self {
+            writer,
+            last_checkpoint: std::time::Instant::now(),
+            checkpoint_every: WAV_CHECKPOINT_EVERY,
+        })
     }
 
     /// Appends samples, converting f32 -> i16 the same way `save_wav_file`
-    /// does.
+    /// does, and checkpoints the header once `checkpoint_every` has passed
+    /// since the last one.
     pub fn write(&mut self, samples: &[f32]) -> Result<()> {
         for &sample in samples {
             let sample_i16 = (sample * i16::MAX as f32) as i16;
             self.writer.write_sample(sample_i16)?;
         }
+        if self.last_checkpoint.elapsed() >= self.checkpoint_every {
+            self.flush()?;
+        }
         Ok(())
     }
 
-    /// Writes the correct header/size in place without closing the file —
-    /// not required for `write()` to be crash-safe (the data itself is
-    /// already past the OS write buffer), only for an external reader to
-    /// see a non-corrupt file while capture is still running. Not currently
-    /// called anywhere; kept for a future recovery-CLI use.
-    #[allow(dead_code)]
+    /// Writes the correct header/size in place without closing the file,
+    /// so a reader that opens the file right now — or a process that finds
+    /// it after this one has died — sees a valid WAV up to the last
+    /// checkpoint. Called by `write()` on its own clock; safe to call at
+    /// any time.
     pub fn flush(&mut self) -> Result<()> {
         self.writer.flush()?;
+        self.last_checkpoint = std::time::Instant::now();
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn with_checkpoint_every(mut self, every: std::time::Duration) -> Self {
+        self.checkpoint_every = every;
+        self
     }
 
     /// Writes the final header/size. Consumes `self` because writing after
@@ -133,9 +164,206 @@ impl StreamingWavWriter {
     }
 }
 
+/// What `repair_wav_header` found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WavRepair {
+    /// The header already described every byte on disk.
+    Intact,
+    /// The header was rewritten to the true size; carries the data length
+    /// (in bytes) it now declares.
+    Repaired { data_bytes: u64 },
+}
+
+/// Rewrites the RIFF and `data` chunk sizes of a plain 44-byte-header PCM
+/// WAV so they match the bytes actually on disk, in place. This is the
+/// by-hand repair of 2026-10-08 (both sizes read 0 on two 27 MB files) made
+/// automatic: with `StreamingWavWriter`'s checkpointing the header is at
+/// most a second stale, and this takes it the rest of the way, so every
+/// sample the OS accepted before the process died is in the file a reader
+/// sees. A torn trailing sample is trimmed rather than declared.
+///
+/// Refuses anything that is not a plain 44-byte header (a `data` chunk not
+/// at byte 36 means extra chunks this code does not understand) — a wrong
+/// repair is worse than none.
+pub fn repair_wav_header<P: AsRef<Path>>(path: P) -> Result<WavRepair> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let path = path.as_ref();
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    let len = file.metadata()?.len();
+    if len < 44 {
+        anyhow::bail!(
+            "{} is {len} bytes — shorter than a WAV header",
+            path.display()
+        );
+    }
+    let mut header = [0u8; 44];
+    file.read_exact(&mut header)?;
+    if &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" {
+        anyhow::bail!("{} is not a RIFF/WAVE file", path.display());
+    }
+    if &header[36..40] != b"data" {
+        anyhow::bail!(
+            "{} does not have a plain 44-byte header (no data chunk at byte 36) — leaving it alone",
+            path.display()
+        );
+    }
+    let block_align = u16::from_le_bytes([header[32], header[33]]).max(1) as u64;
+    let data_bytes = (len - 44) / block_align * block_align;
+    let riff_bytes = 36 + data_bytes;
+    if riff_bytes > u32::MAX as u64 {
+        anyhow::bail!("{} is too large for a RIFF header", path.display());
+    }
+    let riff_now = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as u64;
+    let data_now = u32::from_le_bytes([header[40], header[41], header[42], header[43]]) as u64;
+    if riff_now == riff_bytes && data_now == data_bytes {
+        return Ok(WavRepair::Intact);
+    }
+    file.seek(SeekFrom::Start(4))?;
+    file.write_all(&(riff_bytes as u32).to_le_bytes())?;
+    file.seek(SeekFrom::Start(40))?;
+    file.write_all(&(data_bytes as u32).to_le_bytes())?;
+    if 44 + data_bytes < len {
+        file.set_len(44 + data_bytes)?;
+    }
+    file.sync_all()?;
+    Ok(WavRepair::Repaired { data_bytes })
+}
+
 #[cfg(test)]
 mod streaming_wav_writer_tests {
     use super::*;
+
+    /// The 2026-10-08 failure, in miniature: a writer that is still open
+    /// when the process vanishes (`mem::forget` — no `Drop`, no finalise,
+    /// exactly what `exit(0)` from AppKit's terminate path does) leaves a
+    /// file that is nonetheless a valid WAV holding everything written up
+    /// to the last checkpoint.
+    #[test]
+    fn header_refresh_keeps_file_readable_mid_write() {
+        let path = round_trip_path().with_extension("checkpoint.wav");
+        let mut writer = StreamingWavWriter::create(&path)
+            .unwrap()
+            .with_checkpoint_every(std::time::Duration::ZERO);
+        let frame = vec![0.1_f32; 480];
+        for _ in 0..10 {
+            writer.write(&frame).unwrap();
+        }
+        // The process dies here: no finalize, no Drop.
+        std::mem::forget(writer);
+
+        let samples = read_wav_samples(&path)
+            .expect("a checkpointed file must parse without any finalise having run");
+        assert_eq!(samples.len(), 480 * 10);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Without the checkpoint, the same death leaves the file hound's
+    /// placeholder header describes: zero samples. This is the baseline the
+    /// checkpoint exists to replace, kept as a test so a future refactor
+    /// that drops the checkpoint fails loudly here rather than in a meeting.
+    #[test]
+    fn header_refresh_is_what_makes_the_difference() {
+        let path = round_trip_path().with_extension("no-checkpoint.wav");
+        let mut writer = StreamingWavWriter::create(&path)
+            .unwrap()
+            .with_checkpoint_every(std::time::Duration::from_secs(3600));
+        writer.write(&vec![0.1_f32; 480 * 10]).unwrap();
+        std::mem::forget(writer);
+
+        let samples = read_wav_samples(&path).map(|s| s.len()).unwrap_or(0);
+        assert_eq!(
+            samples, 0,
+            "the unflushed writer should have left nothing readable"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The exact on-disk shape found on 2026-10-08 — RIFF size 0, data
+    /// size 0, megabytes of PCM after the header — is repaired in place and
+    /// then parses with every sample present.
+    #[test]
+    fn repair_wav_header_rebuilds_zeroed_sizes() {
+        use std::io::{Seek, SeekFrom, Write};
+        let path = round_trip_path().with_extension("zeroed.wav");
+        let n = 16_000 * 3;
+        let mut writer = StreamingWavWriter::create(&path).unwrap();
+        writer.write(&vec![0.25_f32; n]).unwrap();
+        writer.finalize().unwrap();
+        assert_eq!(repair_wav_header(&path).unwrap(), WavRepair::Intact);
+
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(4)).unwrap();
+        file.write_all(&[0, 0, 0, 0]).unwrap();
+        file.seek(SeekFrom::Start(40)).unwrap();
+        file.write_all(&[0, 0, 0, 0]).unwrap();
+        drop(file);
+        assert_eq!(
+            read_wav_samples(&path).map(|s| s.len()).unwrap_or(0),
+            0,
+            "the zeroed header should hide every sample, as it did on 2026-10-08"
+        );
+
+        assert_eq!(
+            repair_wav_header(&path).unwrap(),
+            WavRepair::Repaired {
+                data_bytes: (n * 2) as u64
+            }
+        );
+        assert_eq!(read_wav_samples(&path).unwrap().len(), n);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A header that is merely stale (the last checkpoint ran a second
+    /// before death) is brought up to the true length, and a torn trailing
+    /// byte is trimmed rather than declared.
+    #[test]
+    fn repair_wav_header_extends_a_stale_header_and_trims_a_torn_sample() {
+        use std::io::Write;
+        let path = round_trip_path().with_extension("stale.wav");
+        let n = 16_000;
+        let mut writer = StreamingWavWriter::create(&path).unwrap();
+        writer.write(&vec![0.25_f32; n]).unwrap();
+        writer.finalize().unwrap();
+        // Another second of audio landed after the last checkpoint, plus one
+        // torn byte of a sample that never completed.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&vec![0u8; 16_000 * 2 + 1]).unwrap();
+        drop(file);
+        assert_eq!(read_wav_samples(&path).unwrap().len(), n);
+
+        assert_eq!(
+            repair_wav_header(&path).unwrap(),
+            WavRepair::Repaired {
+                data_bytes: (n * 2 * 2) as u64
+            }
+        );
+        assert_eq!(read_wav_samples(&path).unwrap().len(), n * 2);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            44 + (n * 2 * 2) as u64
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Anything that is not a plain 44-byte header is refused, untouched.
+    #[test]
+    fn repair_wav_header_refuses_an_unfamiliar_layout() {
+        let path = round_trip_path().with_extension("odd.wav");
+        let mut bytes = vec![0u8; 64];
+        bytes[0..4].copy_from_slice(b"RIFF");
+        bytes[8..12].copy_from_slice(b"WAVE");
+        bytes[12..16].copy_from_slice(b"LIST");
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(repair_wav_header(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let _ = std::fs::remove_file(&path);
+    }
 
     /// A file only `finalize()`d after every chunk has landed reads back
     /// with the right length and the right samples — the property the

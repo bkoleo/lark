@@ -25,11 +25,12 @@ use tauri_plugin_opener::OpenerExt;
 
 use crate::audio_toolkit::audio::SystemAudioTap;
 use crate::audio_toolkit::audio::{
-    list_input_devices, read_wav_samples, save_wav_file, AudioRecorder, ChunkSink,
-    StreamingWavWriter,
+    list_input_devices, read_wav_samples, repair_wav_header, save_wav_file, AudioRecorder,
+    ChunkSink, StreamingWavWriter, WavRepair,
 };
 use crate::helpers::clamshell;
 use crate::managers::meeting_calendar::{self, CalendarContext};
+use crate::managers::recording_guard::{self, Marker};
 use crate::managers::transcription::TranscriptionManager;
 use crate::settings::get_settings;
 
@@ -123,8 +124,18 @@ enum MeetingState {
         /// write-everything-at-the-end behaviour for that one track.
         mic_wav_path: Option<PathBuf>,
         sys_wav_path: Option<PathBuf>,
+        /// The `<stem>.recording.json` marker guarding this recording
+        /// against Lark dying (`recording_guard`). `None` during standby,
+        /// or when nothing could be streamed to disk — then there is
+        /// nothing on disk to recover either.
+        marker: Option<PathBuf>,
     },
 }
+
+/// A relaunched Lark carries on recording a call that is still live if the
+/// hole left by its death is no longer than this. Longer, and the far side
+/// of the call has moved on without us: transcribe what was captured.
+const RESUME_GAP_MAX: Duration = Duration::from_secs(10 * 60);
 
 pub struct MeetingManager {
     app_handle: AppHandle,
@@ -315,11 +326,18 @@ impl MeetingManager {
     /// rather than failing the caller, and the recording still works
     /// exactly as it did before this task, just without the safety net for
     /// this one call (t17873258798635ef6).
+    ///
+    /// `mic_prefix`/`sys_prefix` — audio that predates this writer (a
+    /// promoted rewind buffer, or the recovered part of a resumed
+    /// recording) — are written into each file *before* the writer is
+    /// installed, so a live chunk can never land ahead of them.
     fn install_streaming_writers(
         &self,
         mic_sink: &ChunkSink,
         sys_sink: &ChunkSink,
         started: DateTime<Local>,
+        mic_prefix: &[f32],
+        sys_prefix: &[f32],
     ) -> (Option<PathBuf>, Option<PathBuf>) {
         let out_dir = match meetings_dir_for(&self.app_handle) {
             Ok(dir) => dir,
@@ -338,10 +356,13 @@ impl MeetingManager {
         // `calendar` field). `process()` renames to the calendar-titled
         // stem once it has one; this name is only ever seen on disk if the
         // app dies before that rename runs.
-        let stem = format!("{} Meeting", started.format("%Y-%m-%d %H%M"));
+        let stem = provisional_stem(started);
 
         let mic_path = out_dir.join(format!("{stem} (mic).wav"));
-        let mic_result = match StreamingWavWriter::create(&mic_path) {
+        let mic_result = match StreamingWavWriter::create(&mic_path).and_then(|mut w| {
+            w.write(mic_prefix)?;
+            Ok(w)
+        }) {
             Ok(writer) => {
                 *mic_sink.lock().unwrap() = Some(writer);
                 Some(mic_path)
@@ -353,7 +374,10 @@ impl MeetingManager {
         };
 
         let sys_path = out_dir.join(format!("{stem} (system).wav"));
-        let sys_result = match StreamingWavWriter::create(&sys_path) {
+        let sys_result = match StreamingWavWriter::create(&sys_path).and_then(|mut w| {
+            w.write(sys_prefix)?;
+            Ok(w)
+        }) {
             Ok(writer) => {
                 *sys_sink.lock().unwrap() = Some(writer);
                 Some(sys_path)
@@ -365,6 +389,27 @@ impl MeetingManager {
         };
 
         (mic_result, sys_result)
+    }
+
+    /// Writes the marker and starts the sentinel for a recording whose
+    /// streamed WAVs are now open. See `recording_guard`.
+    fn arm_guard(
+        &self,
+        started: DateTime<Local>,
+        mic_wav_path: Option<&std::path::Path>,
+        sys_wav_path: Option<&std::path::Path>,
+        calendar_title: Option<String>,
+    ) -> Option<PathBuf> {
+        let dir = meetings_dir_for(&self.app_handle).ok()?;
+        recording_guard::arm(
+            &self.app_handle,
+            &dir,
+            &provisional_stem(started),
+            started,
+            mic_wav_path,
+            sys_wav_path,
+            calendar_title,
+        )
     }
 
     fn start(self: &Arc<Self>) -> Result<()> {
@@ -399,7 +444,13 @@ impl MeetingManager {
         // Start streaming to disk immediately — this is a real recording
         // from the first sample, unlike standby (t17873258798635ef6).
         let (mic_wav_path, sys_wav_path) =
-            self.install_streaming_writers(&capture.mic_sink, &capture.sys_sink, started);
+            self.install_streaming_writers(&capture.mic_sink, &capture.sys_sink, started, &[], &[]);
+        let marker = self.arm_guard(
+            started,
+            mic_wav_path.as_deref(),
+            sys_wav_path.as_deref(),
+            None,
+        );
 
         *state = MeetingState::Recording {
             standby: false,
@@ -414,11 +465,12 @@ impl MeetingManager {
             fallback,
             tap: capture.tap,
             started,
-            calendar: self.spawn_calendar_lookup(),
+            calendar: self.spawn_calendar_lookup(marker.clone()),
             mic_sink: capture.mic_sink,
             sys_sink: capture.sys_sink,
             mic_wav_path,
             sys_wav_path,
+            marker,
         };
         drop(state);
 
@@ -435,12 +487,21 @@ impl MeetingManager {
     /// on a permission dialog for as long as the user takes to answer it, and
     /// nothing about starting a recording may wait for that. `process()`
     /// reads the result an hour later, so the mutex is guard enough.
-    fn spawn_calendar_lookup(&self) -> Arc<Mutex<Option<CalendarContext>>> {
+    ///
+    /// The title is also written into the recording's marker, so a
+    /// transcript rebuilt at the next launch keeps the meeting's name.
+    fn spawn_calendar_lookup(
+        &self,
+        marker: Option<PathBuf>,
+    ) -> Arc<Mutex<Option<CalendarContext>>> {
         let calendar = Arc::new(Mutex::new(None));
         let calendar_sink = calendar.clone();
         std::thread::spawn(move || {
             if let Some(ctx) = meeting_calendar::current_event() {
                 log::info!("Meeting matched calendar event: {:?}", ctx.title);
+                if let (Some(marker), Some(title)) = (&marker, &ctx.title) {
+                    recording_guard::set_title(marker, title);
+                }
                 *calendar_sink.lock().unwrap() = Some(ctx);
             }
         });
@@ -515,6 +576,7 @@ impl MeetingManager {
                 sys_sink: capture.sys_sink,
                 mic_wav_path: None,
                 sys_wav_path: None,
+                marker: None,
             };
         }
 
@@ -549,6 +611,7 @@ impl MeetingManager {
             sys_sink,
             mic_wav_path,
             sys_wav_path,
+            marker,
             ..
         } = &mut *state
         else {
@@ -577,25 +640,24 @@ impl MeetingManager {
         *audio_started = Instant::now() - Duration::from_secs_f64(keep_secs);
         *started = Local::now() - chrono::Duration::milliseconds((keep_secs * 1000.0) as i64);
         *standby = false;
-        *calendar = self.spawn_calendar_lookup();
 
         // Start streaming now that this is a real recording — using the
         // backdated `started` above so the provisional filename already
-        // reflects the true start of the call. Write the promoted pre-roll
-        // as the writer's first samples before returning, so live chunks
-        // (which the consumer thread may already be delivering the instant
-        // the sink is installed) land after it rather than racing it.
-        // (t17873258798635ef6 — the on-disk gap this leaves in the rare
-        // case a chunk lands in the few instructions between `take_buffer`
-        // above and the writer install below is a documented, accepted
-        // limitation: at most a fraction of one ~30ms frame, and only the
-        // on-disk safety-net copy is affected — the in-memory transcription
-        // path via `mic_prefix`/`sys_prefix` is untouched by this.)
-        let (paths_mic, paths_sys) = self.install_streaming_writers(mic_sink, sys_sink, *started);
+        // reflects the true start of the call. The promoted pre-roll goes
+        // into each file before its writer is installed, so a live chunk
+        // the consumer thread delivers the instant the sink fills in lands
+        // after it, never ahead of it (t17873258798635ef6).
+        let (paths_mic, paths_sys) =
+            self.install_streaming_writers(mic_sink, sys_sink, *started, mic_prefix, sys_prefix);
         *mic_wav_path = paths_mic;
         *sys_wav_path = paths_sys;
-        write_to_streamed_wav(mic_sink, mic_prefix, "mic (promoted pre-roll)");
-        write_to_streamed_wav(sys_sink, sys_prefix, "system (promoted pre-roll)");
+        *marker = self.arm_guard(
+            *started,
+            mic_wav_path.as_deref(),
+            sys_wav_path.as_deref(),
+            None,
+        );
+        *calendar = self.spawn_calendar_lookup(marker.clone());
         let mic_name = mic.device_name();
         let fallback = *fallback;
         // Carry the mic's *actual* state across the swap of pills. The
@@ -875,6 +937,7 @@ impl MeetingManager {
             sys_sink,
             mic_wav_path,
             sys_wav_path,
+            marker,
         ) = {
             let mut state = self.state.lock().unwrap();
             match std::mem::replace(&mut *state, MeetingState::Idle) {
@@ -894,6 +957,7 @@ impl MeetingManager {
                     sys_sink,
                     mic_wav_path,
                     sys_wav_path,
+                    marker,
                     ..
                 } => (
                     mic,
@@ -908,6 +972,7 @@ impl MeetingManager {
                     sys_sink,
                     mic_wav_path,
                     sys_wav_path,
+                    marker,
                 ),
                 other => {
                     *state = other;
@@ -933,6 +998,12 @@ impl MeetingManager {
         // disk is valid and holds the audio up to this exact moment.
         let mic_wav_path = finalize_streamed_wav(&mic_sink, mic_wav_path, "mic");
         let sys_wav_path = finalize_streamed_wav(&sys_sink, sys_wav_path, "system");
+        // The recording ended on purpose: the sentinel stands down. The
+        // marker itself stays until the transcript is written, so a death
+        // during transcription is finished at the next launch.
+        if let Some(marker) = &marker {
+            recording_guard::mark_ended(marker);
+        }
 
         let mut mic_samples = mic_prefix;
         match mic.stop() {
@@ -1001,6 +1072,9 @@ impl MeetingManager {
             match result {
                 Ok(path) => {
                     log::info!("Meeting transcript written to {}", path.display());
+                    if let Some(marker) = &marker {
+                        recording_guard::disarm(marker);
+                    }
                     let _ = manager
                         .app_handle
                         .opener()
@@ -1017,7 +1091,470 @@ impl MeetingManager {
                         None,
                     );
                 }
-                Err(e) => log::error!("Meeting transcription failed: {e}"),
+                Err(e) => log::error!(
+                    "Meeting transcription failed: {e} — the audio is on disk and the next launch will try again"
+                ),
+            }
+        });
+    }
+
+    /// The process is ending — a confirmed quit, a signal, a logout. Leaves
+    /// the streamed WAVs valid on disk and the marker saying the recording
+    /// was ended on purpose, so the next launch builds the transcript and
+    /// the sentinel stays quiet. Never blocks: the exit is happening
+    /// whatever this function manages to do, so it waits at most two
+    /// seconds for the state lock and leaves the audio devices to the OS
+    /// rather than risk the teardown hang of 2026-08-21.
+    pub fn finalize_for_exit(&self, reason: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut state = loop {
+            match self.state.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    log::error!(
+                        "Lark exiting ({reason}): the recording state stayed locked — the streamed WAV headers were refreshed within the last second and are repaired at the next launch"
+                    );
+                    recording_guard::on_exit();
+                    return;
+                }
+            }
+        };
+        match std::mem::replace(&mut *state, MeetingState::Idle) {
+            MeetingState::Idle => {}
+            MeetingState::Recording {
+                standby: true,
+                mic,
+                tap,
+                ..
+            } => {
+                std::mem::forget(mic);
+                std::mem::forget(tap);
+                log::info!("Lark exiting ({reason}) with a rewind buffer running — discarded");
+            }
+            MeetingState::Recording {
+                mic,
+                tap,
+                mic_sink,
+                sys_sink,
+                mic_wav_path,
+                sys_wav_path,
+                marker,
+                started,
+                audio_started,
+                ..
+            } => {
+                let mic_ok = finalize_streamed_wav(&mic_sink, mic_wav_path, "mic").is_some();
+                let sys_ok = finalize_streamed_wav(&sys_sink, sys_wav_path, "system").is_some();
+                std::mem::forget(mic);
+                std::mem::forget(tap);
+                if let Some(marker) = &marker {
+                    recording_guard::mark_ended(marker);
+                }
+                log::warn!(
+                    "Lark exiting ({reason}) while recording {:?} ({:.0}s in): audio finalised on disk (mic {}, system {}); the transcript will be built at the next launch",
+                    provisional_stem(started),
+                    audio_started.elapsed().as_secs_f32(),
+                    if mic_ok { "ok" } else { "not streamed" },
+                    if sys_ok { "ok" } else { "not streamed" },
+                );
+            }
+        }
+        drop(state);
+        recording_guard::on_exit();
+    }
+
+    /// Finishes every recording a previous run left unfinished — the
+    /// marker files in the meetings folder (`recording_guard`). Run once,
+    /// shortly after launch. For each marker: the WAV headers are repaired
+    /// if the run died without finalising them, then either the recording
+    /// is **resumed** (the call is still live, the hole is short, and the
+    /// recording was not ended on purpose) or its **transcript is built**
+    /// from the audio. Nothing here needs a hand to touch a file.
+    pub fn recover_dead_recordings(self: &Arc<Self>) {
+        let Ok(dir) = meetings_dir_for(&self.app_handle) else {
+            return;
+        };
+        let own_pid = std::process::id();
+        for (marker_path, marker) in recording_guard::markers_in(&dir) {
+            if marker.pid == own_pid {
+                continue;
+            }
+            let prefix = recording_guard::stem_prefix(&marker.stem).to_string();
+            if transcript_exists(&dir, &prefix) {
+                log::info!(
+                    "Recording {:?} already has its transcript — clearing the marker it left",
+                    marker.stem
+                );
+                recording_guard::disarm(&marker_path);
+                continue;
+            }
+            let Some(started) = marker.started() else {
+                log::warn!(
+                    "Recording marker {} has an unreadable start time — left alone",
+                    marker_path.display()
+                );
+                continue;
+            };
+
+            let mic_path = locate_track(&dir, marker.mic_wav.as_deref(), &prefix, "mic");
+            let sys_path = locate_track(&dir, marker.sys_wav.as_deref(), &prefix, "system");
+            for (path, label) in [(&mic_path, "mic"), (&sys_path, "system")] {
+                let Some(path) = path else { continue };
+                match repair_wav_header(path) {
+                    Ok(WavRepair::Repaired { data_bytes }) => log::warn!(
+                        "Repaired the {label} WAV header of {:?}: {:.1}s of audio was on disk with a zeroed header",
+                        marker.stem,
+                        data_bytes as f32 / 2.0 / SAMPLE_RATE as f32
+                    ),
+                    Ok(WavRepair::Intact) => {}
+                    Err(e) => log::warn!(
+                        "Could not check the {label} WAV header of {:?}: {e}",
+                        marker.stem
+                    ),
+                }
+            }
+            let read_track = |path: &Option<PathBuf>, label: &str| -> Vec<f32> {
+                let Some(path) = path else {
+                    return Vec::new();
+                };
+                read_wav_samples(path).unwrap_or_else(|e| {
+                    log::warn!("No readable {label} track for {:?} ({e})", marker.stem);
+                    Vec::new()
+                })
+            };
+            let mic_samples = read_track(&mic_path, "mic");
+            let sys_samples = read_track(&sys_path, "system");
+            if mic_samples.is_empty() && sys_samples.is_empty() {
+                log::error!(
+                    "Recording {:?} died and left no readable audio — its marker is kept for inspection: {}",
+                    marker.stem,
+                    marker_path.display()
+                );
+                continue;
+            }
+
+            // The hole: from the last header refresh (≤1s before the death)
+            // to now. Filled with silence if the recording resumes, so the
+            // timestamps on both sides of it stay true.
+            let newest_write = [&mic_path, &sys_path]
+                .into_iter()
+                .flatten()
+                .filter_map(|p| std::fs::metadata(p).ok()?.modified().ok())
+                .max();
+            let gap = newest_write
+                .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+                .unwrap_or(RESUME_GAP_MAX + Duration::from_secs(1));
+            let call_live = crate::managers::meeting_detect::call_mic(own_pid as i32).is_some();
+            let alerted_flag = recording_guard::alerted_path(&marker_path);
+            let already_alerted = alerted_flag.exists();
+            let _ = std::fs::remove_file(&alerted_flag);
+            let title = marker.calendar_title.clone();
+
+            if !marker.ended_by_lark && call_live && gap <= RESUME_GAP_MAX {
+                match self.start_resumed(
+                    &marker,
+                    started,
+                    mic_samples.clone(),
+                    sys_samples.clone(),
+                    gap,
+                ) {
+                    Ok(()) => {
+                        if !already_alerted {
+                            crate::audio_feedback::play_alert("recording resumed after a death");
+                        }
+                        continue;
+                    }
+                    Err(e) => log::error!(
+                        "Could not resume the recording {:?} ({e}) — transcribing what was captured instead",
+                        marker.stem
+                    ),
+                }
+            }
+
+            if marker.ended_by_lark {
+                log::info!(
+                    "Recovered a recording that died before its transcript was written: {:?} (mic {:.1}s, system {:.1}s)",
+                    marker.stem,
+                    mic_samples.len() as f32 / SAMPLE_RATE as f32,
+                    sys_samples.len() as f32 / SAMPLE_RATE as f32,
+                );
+            } else {
+                log::warn!(
+                    "Recovered a recording that died while live: {:?} (mic {:.1}s, system {:.1}s; {} — not resuming)",
+                    marker.stem,
+                    mic_samples.len() as f32 / SAMPLE_RATE as f32,
+                    sys_samples.len() as f32 / SAMPLE_RATE as f32,
+                    if !call_live {
+                        "no call is live now".to_string()
+                    } else {
+                        format!("the hole is {:.0}s long", gap.as_secs_f32())
+                    }
+                );
+                if !already_alerted {
+                    crate::audio_feedback::play_alert("recording died while live");
+                }
+            }
+            if let Some(title) = &title {
+                log::info!(
+                    "Recovered recording {:?} keeps the calendar title {title:?} from the marker",
+                    marker.stem
+                );
+            }
+            self.transcribe_recovered(
+                &dir,
+                marker_path,
+                title,
+                started,
+                mic_samples,
+                sys_samples,
+                mic_path,
+                sys_path,
+            );
+        }
+
+        self.recover_unmarked_recordings(&dir);
+    }
+
+    /// Recordings a build *without* markers left behind: a provisional
+    /// `… Meeting (mic|system).wav` pair with no transcript, untouched for
+    /// a minute, guarded by no marker. Transcribed with no title.
+    fn recover_unmarked_recordings(self: &Arc<Self>, dir: &std::path::Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut prefixes: Vec<String> = Vec::new();
+        let cutoff = std::time::SystemTime::now() - Duration::from_secs(60);
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(stem) = name
+                .strip_suffix(" (mic).wav")
+                .or_else(|| name.strip_suffix(" (system).wav"))
+            else {
+                continue;
+            };
+            if !stem.ends_with(" Meeting") {
+                continue;
+            }
+            let prefix = recording_guard::stem_prefix(stem).to_string();
+            if prefixes.contains(&prefix)
+                || transcript_exists(dir, &prefix)
+                || recording_guard::guarded(dir, &prefix)
+            {
+                continue;
+            }
+            let recent = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .map(|t| t > cutoff)
+                .unwrap_or(true);
+            if recent {
+                continue;
+            }
+            prefixes.push(prefix);
+        }
+        for prefix in prefixes {
+            let Some(started) = parse_stem_start(&prefix) else {
+                continue;
+            };
+            let mic_path = locate_track(dir, None, &prefix, "mic");
+            let sys_path = locate_track(dir, None, &prefix, "system");
+            for path in [&mic_path, &sys_path].into_iter().flatten() {
+                if let Ok(WavRepair::Repaired { .. }) = repair_wav_header(path) {
+                    log::warn!("Repaired the WAV header of {}", path.display());
+                }
+            }
+            let mic_samples = mic_path
+                .as_ref()
+                .and_then(|p| read_wav_samples(p).ok())
+                .unwrap_or_default();
+            let sys_samples = sys_path
+                .as_ref()
+                .and_then(|p| read_wav_samples(p).ok())
+                .unwrap_or_default();
+            if mic_samples.is_empty() && sys_samples.is_empty() {
+                continue;
+            }
+            log::warn!(
+                "Recovered a recording that died with no marker (an older build): {prefix} Meeting (mic {:.1}s, system {:.1}s)",
+                mic_samples.len() as f32 / SAMPLE_RATE as f32,
+                sys_samples.len() as f32 / SAMPLE_RATE as f32,
+            );
+            self.transcribe_recovered(
+                dir,
+                dir.join(format!(
+                    "{prefix} Meeting{}",
+                    recording_guard::MARKER_SUFFIX
+                )),
+                None,
+                started,
+                mic_samples,
+                sys_samples,
+                mic_path,
+                sys_path,
+            );
+        }
+    }
+
+    /// Carries on a recording a previous run died in the middle of: the
+    /// audio already on disk becomes the head of the take, the hole is
+    /// filled with silence, and fresh capture continues into the same
+    /// files under the same name — so the transcript reads as one meeting.
+    #[allow(clippy::too_many_arguments)]
+    fn start_resumed(
+        self: &Arc<Self>,
+        marker: &Marker,
+        started: DateTime<Local>,
+        mut mic_prefix: Vec<f32>,
+        mut sys_prefix: Vec<f32>,
+        gap: Duration,
+    ) -> Result<()> {
+        // The call detector may already have a rewind buffer running for
+        // this same call: it is discarded — the recording predates it.
+        self.stop_standby("resuming the recording that died");
+
+        let mut state = self.state.lock().unwrap();
+        if !matches!(*state, MeetingState::Idle) {
+            return Err(anyhow!("a recording is already active"));
+        }
+        *self.manual_mic.lock().unwrap() = None;
+        let capture = self.open_capture()?;
+
+        let recovered_secs = mic_prefix.len().max(sys_prefix.len()) as f32 / SAMPLE_RATE as f32;
+        let gap_samples = (gap.as_secs_f64() * SAMPLE_RATE as f64) as usize;
+        let head = mic_prefix.len().max(sys_prefix.len()) + gap_samples;
+        mic_prefix.resize(head, 0.0);
+        sys_prefix.resize(head, 0.0);
+        let audio_started =
+            Instant::now() - Duration::from_secs_f64(head as f64 / SAMPLE_RATE as f64);
+
+        let (mic_wav_path, sys_wav_path) = self.install_streaming_writers(
+            &capture.mic_sink,
+            &capture.sys_sink,
+            started,
+            &mic_prefix,
+            &sys_prefix,
+        );
+        let title = marker.calendar_title.clone();
+        let new_marker = self.arm_guard(
+            started,
+            mic_wav_path.as_deref(),
+            sys_wav_path.as_deref(),
+            title.clone(),
+        );
+        let calendar = Arc::new(Mutex::new(title.clone().map(|t| CalendarContext {
+            title: Some(t),
+            ..Default::default()
+        })));
+        let mic_name = capture.mic_name.clone();
+        let fallback = capture.fallback;
+        *state = MeetingState::Recording {
+            standby: false,
+            mic: capture.mic,
+            mic_prefix,
+            sys_prefix,
+            capture_started: capture.capture_started,
+            audio_started,
+            flow_last_ms: capture.flow_last_ms,
+            last_restart_ms: 0,
+            restarts: 0,
+            fallback,
+            tap: capture.tap,
+            started,
+            calendar,
+            mic_sink: capture.mic_sink,
+            sys_sink: capture.sys_sink,
+            mic_wav_path,
+            sys_wav_path,
+            marker: new_marker,
+        };
+        drop(state);
+
+        self.spawn_mic_watchdog();
+        log::warn!(
+            "Lark restarted mid-call and resumed the recording {:?}: {recovered_secs:.1}s recovered from disk, a {:.0}s hole filled with silence (mic: {mic_name})",
+            marker.stem,
+            gap.as_secs_f32()
+        );
+        crate::overlay::show_meeting_recording_indicator(&self.app_handle);
+        crate::overlay::emit_meeting_mic_status(&self.app_handle, Some(&mic_name), true, fallback);
+        crate::overlay::show_meeting_prompt(
+            &self.app_handle,
+            "resumed",
+            "",
+            title.as_deref(),
+            None,
+            None,
+        );
+        crate::tray::update_tray_menu(&self.app_handle, &crate::tray::TrayIconState::Idle, None);
+        Ok(())
+    }
+
+    /// Builds the transcript of a recovered recording on a detached thread,
+    /// the same way a stopped meeting's is built. The marker is cleared
+    /// only once the `.md` is on disk; on failure it stays, and the next
+    /// launch tries again.
+    #[allow(clippy::too_many_arguments)]
+    fn transcribe_recovered(
+        self: &Arc<Self>,
+        dir: &std::path::Path,
+        marker_path: PathBuf,
+        title: Option<String>,
+        started: DateTime<Local>,
+        mic_samples: Vec<f32>,
+        sys_samples: Vec<f32>,
+        mic_path: Option<PathBuf>,
+        sys_path: Option<PathBuf>,
+    ) {
+        recording_guard::remove_stale_sidecars(
+            dir,
+            recording_guard::stem_prefix(&provisional_stem(started)),
+        );
+        let calendar = title.clone().map(|t| CalendarContext {
+            title: Some(t),
+            ..Default::default()
+        });
+        let manager = self.clone();
+        self.processing.fetch_add(1, Ordering::SeqCst);
+        std::thread::spawn(move || {
+            let _guard = ProcessingGuard(&manager.processing);
+            let result = manager.process(
+                mic_samples,
+                sys_samples,
+                started,
+                calendar,
+                mic_path,
+                sys_path,
+            );
+            drop(_guard);
+            if manager.status() != MeetingStatus::Recording {
+                crate::tray::update_tray_menu(
+                    &manager.app_handle,
+                    &crate::tray::TrayIconState::Idle,
+                    None,
+                );
+            }
+            match result {
+                Ok(path) => {
+                    log::info!("Meeting transcript written to {}", path.display());
+                    recording_guard::disarm(&marker_path);
+                    crate::overlay::show_meeting_prompt(
+                        &manager.app_handle,
+                        "recovered",
+                        "",
+                        title.as_deref(),
+                        None,
+                        None,
+                    );
+                }
+                Err(e) => log::error!(
+                    "Recovered meeting transcription failed ({e}) — the marker stays so the next launch tries again: {}",
+                    marker_path.display()
+                ),
             }
         });
     }
@@ -1671,6 +2208,58 @@ fn write_to_streamed_wav(sink: &ChunkSink, samples: &[f32], label: &str) {
     }
 }
 
+/// The on-disk name a recording streams under before its calendar title is
+/// known — and the stem its marker is named after.
+fn provisional_stem(started: DateTime<Local>) -> String {
+    format!("{} Meeting", started.format("%Y-%m-%d %H%M"))
+}
+
+/// The start time encoded in a stem's `YYYY-MM-DD HHMM` prefix.
+fn parse_stem_start(prefix: &str) -> Option<DateTime<Local>> {
+    chrono::NaiveDateTime::parse_from_str(prefix.get(..15)?, "%Y-%m-%d %H%M")
+        .ok()?
+        .and_local_timezone(Local)
+        .single()
+}
+
+/// Whether a transcript for the recording that starts with `prefix` exists.
+fn transcript_exists(dir: &std::path::Path, prefix: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        name.starts_with(prefix) && name.ends_with(".md")
+    })
+}
+
+/// Finds a recording's `(mic|system).wav`: at the path the marker recorded
+/// if it is still there, otherwise by the stem's date-time prefix —
+/// `process()` renames the file to its calendar title before it finishes.
+fn locate_track(
+    dir: &std::path::Path,
+    hinted: Option<&std::path::Path>,
+    prefix: &str,
+    label: &str,
+) -> Option<PathBuf> {
+    if let Some(hinted) = hinted {
+        if hinted.exists() {
+            return Some(hinted.to_path_buf());
+        }
+    }
+    let suffix = format!(" ({label}).wav");
+    let entries = std::fs::read_dir(dir).ok()?;
+    entries.flatten().map(|e| e.path()).find(|p| {
+        p.file_name()
+            .map(|n| {
+                let n = n.to_string_lossy();
+                n.starts_with(prefix) && n.ends_with(&suffix)
+            })
+            .unwrap_or(false)
+    })
+}
+
 /// Takes the writer out of `sink` (if any) and finalises it — writes the
 /// real WAV header/size, without which the file is not a valid WAV a reader
 /// can open. Returns `path` unchanged on success, so the caller can pass it
@@ -1824,6 +2413,12 @@ pub fn recover_orphaned_meetings(app_handle: &AppHandle) {
             let _ = std::fs::remove_file(&path);
             continue;
         }
+        // A marker means the audio itself is still there and
+        // `recover_dead_recordings` is rebuilding the whole transcript from
+        // it — better than the fragment this sidecar holds.
+        if recording_guard::guarded(&dir, &stem) {
+            continue;
+        }
         let Ok(raw) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -1903,6 +2498,12 @@ fn cleanup_old_meeting_wavs(dir: &std::path::Path) {
         return;
     };
     let cutoff = std::time::SystemTime::now() - Duration::from_secs(24 * 3600);
+    // Audio still guarded by a marker has no transcript yet — it is kept
+    // whatever its age, until `recover_dead_recordings` has used it.
+    let guarded: Vec<String> = recording_guard::markers_in(dir)
+        .into_iter()
+        .map(|(_, m)| recording_guard::stem_prefix(&m.stem).to_string())
+        .collect();
     for entry in entries.flatten() {
         let path = entry.path();
         let is_wav = path
@@ -1910,6 +2511,11 @@ fn cleanup_old_meeting_wavs(dir: &std::path::Path) {
             .map(|e| e.eq_ignore_ascii_case("wav"))
             .unwrap_or(false);
         if !is_wav {
+            continue;
+        }
+        let name = entry.file_name();
+        let prefix = recording_guard::stem_prefix(&name.to_string_lossy()).to_string();
+        if guarded.contains(&prefix) {
             continue;
         }
         let expired = entry

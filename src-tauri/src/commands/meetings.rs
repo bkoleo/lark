@@ -98,7 +98,11 @@ pub fn meeting_set_mic(app: AppHandle, device: String) -> Result<(), String> {
             .state::<std::sync::Arc<crate::managers::meeting::MeetingManager>>()
             .inner()
             .clone();
-        manager.set_manual_mic(if device.is_empty() { None } else { Some(device) });
+        manager.set_manual_mic(if device.is_empty() {
+            None
+        } else {
+            Some(device)
+        });
         Ok(())
     }
     #[cfg(not(target_os = "macos"))]

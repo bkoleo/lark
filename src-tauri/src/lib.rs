@@ -15,6 +15,8 @@ mod meeting_reminder;
 mod overlay;
 mod paste_guard;
 pub mod portable;
+#[cfg(target_os = "macos")]
+mod quit_guard;
 mod settings;
 mod shortcut;
 mod signal_handle;
@@ -34,7 +36,7 @@ use managers::history::HistoryManager;
 use managers::model::ModelManager;
 use managers::transcription::TranscriptionManager;
 #[cfg(unix)]
-use signal_hook::consts::{SIGUSR1, SIGUSR2};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGUSR1, SIGUSR2};
 #[cfg(unix)]
 use signal_hook::iterator::Signals;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -171,8 +173,17 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     app_handle.manage(history_manager.clone());
     #[cfg(target_os = "macos")]
     {
+        let recovery = meeting_manager.clone();
         app_handle.manage(meeting_manager);
         managers::meeting_detect::spawn_meeting_detector(app_handle);
+        // Finish whatever the previous run left mid-recording: repair the
+        // WAV headers, then resume the recording (call still live) or
+        // build its transcript. A few seconds in, so the call detector
+        // has had its first poll and the model manager is up.
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            recovery.recover_dead_recordings();
+        });
     }
 
     // Startup maintenance: warn on low disk and recover any recordings whose
@@ -184,9 +195,13 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     // after permissions are confirmed (on macOS) or after onboarding completes.
     // This matches the pattern used for Enigo initialization.
 
+    // SIGTERM/SIGINT/SIGHUP end the process on purpose (`kill`, a
+    // terminal closing, a logout that reaches us as a signal): the handler
+    // finalises any recording before exiting, instead of the default
+    // instant death that left the 2026-10-08 WAVs with zeroed headers.
     #[cfg(unix)]
-    let signals = Signals::new(&[SIGUSR1, SIGUSR2]).unwrap();
-    // Set up signal handlers for toggling transcription
+    let signals = Signals::new([SIGUSR1, SIGUSR2, SIGTERM, SIGINT, SIGHUP]).unwrap();
+    // Set up signal handlers for toggling transcription and for exiting
     #[cfg(unix)]
     signal_handle::setup_signal_handler(app_handle.clone(), signals);
 
@@ -677,7 +692,30 @@ pub fn run(cli_args: CliArgs) {
             let app_handle = app.handle().clone();
             app.manage(TranscriptionCoordinator::new(app_handle.clone()));
 
+            // A panic on any thread lands in handy.log with its location
+            // before the default hook prints it to stderr (which nobody
+            // reads for a bundled app). The one line that was missing
+            // whenever "did it crash?" was asked.
+            let default_hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                let location = info
+                    .location()
+                    .map(|l| format!("{}:{}", l.file(), l.line()))
+                    .unwrap_or_else(|| "unknown location".to_string());
+                let message = info
+                    .payload()
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_string());
+                log::error!("PANIC at {location}: {message}");
+                default_hook(info);
+            }));
+
             initialize_core_logic(&app_handle);
+
+            #[cfg(target_os = "macos")]
+            quit_guard::install(&app_handle);
 
             // Pre-warm GPU/accelerator enumeration on a background thread.
             // The first call into transcribe_rs::whisper_cpp::gpu::list_gpu_devices
@@ -744,8 +782,28 @@ pub fn run(cli_args: CliArgs) {
         .expect("error while building tauri application")
         .run(|app, event| {
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen { .. } = &event {
-                show_main_window(app);
+            match &event {
+                tauri::RunEvent::Reopen { .. } => show_main_window(app),
+                // Tray Quit and `app.exit()`: the same veto as Cmd-Q and the
+                // Dock (`quit_guard`). A session-ending quit never comes
+                // through here — AppKit delivers that to the delegate.
+                tauri::RunEvent::ExitRequested { api, code, .. } => {
+                    if !quit_guard::allow_quit(&format!("app.exit({code:?})")) {
+                        api.prevent_exit();
+                    }
+                }
+                // The process is going down whatever happens next: leave the
+                // streamed WAVs valid and the marker saying the recording
+                // ended on purpose, so the next launch only has to transcribe.
+                tauri::RunEvent::Exit => {
+                    if let Some(meetings) =
+                        app.try_state::<Arc<managers::meeting::MeetingManager>>()
+                    {
+                        meetings.finalize_for_exit("process exit");
+                    }
+                    log::info!("Lark exiting");
+                }
+                _ => {}
             }
             let _ = (app, event); // suppress unused warnings on non-macOS
         });

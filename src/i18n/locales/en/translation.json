@@ -658,7 +658,15 @@
     "autoMic": "Automatic (follow the call)",
     "readyAria": "Record this call",
     "upcomingTitle": "Upcoming meeting",
-    "upcomingSubtitle": "Starts in {{minutes}} min"
+    "upcomingSubtitle": "Starts in {{minutes}} min",
+    "quitTitle": "Lark is recording",
+    "quitSubtitle": "Quit anyway? The audio is kept either way",
+    "quitButton": "Quit",
+    "quitButtonSubtitle": "and stop recording",
+    "resumedTitle": "Recording resumed",
+    "resumedSubtitle": "Lark restarted mid-call and is recording again",
+    "recoveredTitle": "Meeting recovered",
+    "recoveredSubtitle": "Lark stopped mid-recording — transcript rebuilt from the audio"
   },
   "meetings": {
     "searchPlaceholder": "Search meetings…",

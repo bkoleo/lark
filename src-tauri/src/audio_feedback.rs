@@ -140,3 +140,25 @@ fn play_audio_file(
 
     Ok(())
 }
+
+/// The sound Lark makes when it has to be heard whatever the feedback
+/// setting says: a recording stopped while a call was still going, or a
+/// quit that would have ended one (2026-10-08). A system sound through
+/// `afplay` rather than rodio, so the same sound works from the death
+/// sentinel — a shell script with no audio stack — and from an app that is
+/// halfway through tearing itself down.
+pub const ALERT_SOUND: &str = "/System/Library/Sounds/Sosumi.aiff";
+
+pub fn play_alert(reason: &str) {
+    let reason = reason.to_string();
+    thread::spawn(move || {
+        match std::process::Command::new("/usr/bin/afplay")
+            .arg(ALERT_SOUND)
+            .status()
+        {
+            Ok(status) if status.success() => debug!("Alert sound played ({reason})"),
+            Ok(status) => warn!("Alert sound exited with {status} ({reason})"),
+            Err(e) => error!("Alert sound failed to start ({reason}): {e}"),
+        }
+    });
+}

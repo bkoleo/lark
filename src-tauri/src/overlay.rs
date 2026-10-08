@@ -579,8 +579,7 @@ fn attach_meeting_drag_tracking(app_handle: &AppHandle) {
 /// transient top-right ask.
 #[cfg(target_os = "macos")]
 pub fn create_meeting_prompt_window(app_handle: &AppHandle) {
-    let Some((x, y)) =
-        meeting_window_position(app_handle, MEETING_CARD_WIDTH, MEETING_CARD_HEIGHT)
+    let Some((x, y)) = meeting_window_position(app_handle, MEETING_CARD_WIDTH, MEETING_CARD_HEIGHT)
     else {
         return;
     };

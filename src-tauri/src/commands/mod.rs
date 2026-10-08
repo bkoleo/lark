@@ -70,6 +70,13 @@ pub fn meeting_prompt_action(app: AppHandle, action: String) -> Result<(), Strin
                         .map(|(buffered, _)| buffered),
                 );
             }
+            // The quit card's own button: the user has seen the veto and
+            // still wants out. `quit_guard::confirm` lets the next request
+            // through, and `app.exit` raises it.
+            "quit_confirm" => {
+                crate::quit_guard::confirm();
+                app.exit(0);
+            }
             "collapse" => {
                 // A card nobody answered. Timing out is not a "no": while a
                 // call is still being buffered the Record button goes back

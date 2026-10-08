@@ -13,7 +13,15 @@ import { syncLanguageFromSettings } from "@/i18n";
 import "./MeetingPrompt.css";
 
 interface MeetingPromptPayload {
-  kind: "start" | "stop" | "stop_ask" | "saved" | "upcoming";
+  kind:
+    | "start"
+    | "stop"
+    | "stop_ask"
+    | "saved"
+    | "upcoming"
+    | "quit"
+    | "resumed"
+    | "recovered";
   app: string;
   /** Real calendar event title, when the calendar matched. */
   title?: string | null;
@@ -140,7 +148,9 @@ const MeetingPrompt: React.FC = () => {
     // the meeting it announces has started, then puts itself away — capped,
     // so a long reminder lead can't park a card on screen for an hour.
     const ms =
-      mode.payload.kind === "saved"
+      mode.payload.kind === "saved" ||
+      mode.payload.kind === "resumed" ||
+      mode.payload.kind === "recovered"
         ? 6000
         : mode.payload.kind === "upcoming"
           ? Math.min(mode.payload.minutes ?? 1, 5) * 60000
@@ -164,7 +174,8 @@ const MeetingPrompt: React.FC = () => {
       | "dismiss"
       | "collapse"
       | "expand_stop"
-      | "expand_record",
+      | "expand_record"
+      | "quit_confirm",
   ) => {
     if (action === "record" || action === "stop") {
       recordingStartRef.current = null;
@@ -425,6 +436,84 @@ const MeetingPrompt: React.FC = () => {
           <button
             className="meeting-card-dismiss"
             onClick={() => answer("collapse")}
+            aria-label={t("meetingPrompt.dismiss")}
+          >
+            <CancelIcon />
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // Lark restarted mid-call and picked the recording back up, or rebuilt
+  // a dead recording's transcript at launch: the same green beat as
+  // "saved", because in both cases the outcome is that nothing was lost.
+  // The × collapses (never dismisses): a resumed recording must keep
+  // running, and a recovery card must never drop a fresh rewind buffer.
+  if (payload.kind === "resumed" || payload.kind === "recovered") {
+    const resumed = payload.kind === "resumed";
+    return (
+      <div className="meeting-card saved fade-in" {...dragProps}>
+        <div className="meeting-card-accent green" />
+        <div className="meeting-card-body">
+          <div className="meeting-card-check">
+            <CheckIcon width={12} height={12} color="#248a3d" />
+          </div>
+          <div className="meeting-card-text">
+            <div className="meeting-card-title">
+              {resumed
+                ? t("meetingPrompt.resumedTitle")
+                : t("meetingPrompt.recoveredTitle")}
+            </div>
+            <div className="meeting-card-time">
+              {payload.title ||
+                (resumed
+                  ? t("meetingPrompt.resumedSubtitle")
+                  : t("meetingPrompt.recoveredSubtitle"))}
+            </div>
+          </div>
+          <button
+            className="meeting-card-dismiss"
+            onClick={() => answer("collapse")}
+            aria-label={t("meetingPrompt.dismiss")}
+          >
+            <CancelIcon />
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // A quit (Cmd-Q, the Dock, the tray) arrived while a meeting is recording
+  // and was vetoed. The button is the deliberate way out; × keeps recording.
+  if (payload.kind === "quit") {
+    return (
+      <div className="meeting-card fade-in" {...dragProps}>
+        <div className="meeting-card-accent blue" />
+        <div className="meeting-card-body">
+          <div className="meeting-card-text">
+            <div className="meeting-card-title">
+              {payload.title || t("meetingPrompt.quitTitle")}
+            </div>
+            <div className="meeting-card-time">
+              {t("meetingPrompt.quitSubtitle")}
+            </div>
+          </div>
+          <button
+            className="meeting-card-button blue"
+            onClick={() => answer("quit_confirm")}
+          >
+            <StopIcon width={16} height={16} color="#ffffff" />
+            <span className="meeting-card-button-label">
+              <span className="l1">{t("meetingPrompt.quitButton")}</span>
+              <span className="l2">
+                {t("meetingPrompt.quitButtonSubtitle")}
+              </span>
+            </span>
+          </button>
+          <button
+            className="meeting-card-dismiss"
+            onClick={() => answer("dismiss")}
             aria-label={t("meetingPrompt.dismiss")}
           >
             <CancelIcon />

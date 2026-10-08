@@ -6,4 +6,6 @@ pub mod meeting;
 pub mod meeting_calendar;
 pub mod meeting_detect;
 pub mod model;
+#[cfg(target_os = "macos")]
+pub mod recording_guard;
 pub mod transcription;

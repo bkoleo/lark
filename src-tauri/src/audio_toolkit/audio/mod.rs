@@ -12,5 +12,8 @@ pub use recorder::{is_microphone_access_denied, is_no_input_device_error, AudioR
 pub use resampler::FrameResampler;
 #[cfg(target_os = "macos")]
 pub use system_tap::SystemAudioTap;
-pub use utils::{read_wav_samples, save_wav_file, verify_wav_file, ChunkSink, StreamingWavWriter};
+pub use utils::{
+    read_wav_samples, repair_wav_header, save_wav_file, verify_wav_file, ChunkSink,
+    StreamingWavWriter, WavRepair,
+};
 pub use visualizer::AudioVisualiser;
