@@ -607,9 +607,23 @@ impl TranscriptionManager {
             // don't put it back, instead of poisoning the mutex.
             let mut engine = self.acquire_engine(&settings.selected_model)?;
 
-            let transcribe_result = catch_unwind(AssertUnwindSafe(
-                || -> Result<transcribe_rs::TranscriptionResult> {
-                    match &mut engine {
+            // A single Parakeet pass fails deterministically somewhere past
+            // ~5 minutes (and slows to a crawl well before), so a long take is
+            // fed to the engine in ~1-minute chunks cut at quiet moments.
+            let chunks = split_for_engine(&audio);
+            if chunks.len() > 1 {
+                info!(
+                    "Long take ({:.0}s): transcribing in {} chunks",
+                    audio.len() as f64 / SAMPLE_RATE as f64,
+                    chunks.len()
+                );
+            }
+
+            let transcribe_result = catch_unwind(AssertUnwindSafe(|| -> Result<String> {
+                let run_one = |engine: &mut LoadedEngine,
+                               audio: &[f32]|
+                 -> Result<transcribe_rs::TranscriptionResult> {
+                    match engine {
                         LoadedEngine::Whisper(whisper_engine) => {
                             let whisper_language = if validated_language == "auto" {
                                 None
@@ -714,8 +728,30 @@ impl TranscriptionManager {
                                 .map_err(|e| anyhow::anyhow!("Cohere transcription failed: {}", e))
                         }
                     }
-                },
-            ));
+                };
+
+                if chunks.len() == 1 {
+                    let (start, end) = chunks[0];
+                    return Ok(run_one(&mut engine, &audio[start..end])?.text);
+                }
+                let mut parts: Vec<String> = Vec::with_capacity(chunks.len());
+                for (i, &(start, end)) in chunks.iter().enumerate() {
+                    let text = run_one(&mut engine, &audio[start..end])
+                        .map_err(|e| e.context(format!("chunk {}/{}", i + 1, chunks.len())))?
+                        .text;
+                    debug!(
+                        "Chunk {}/{} ({:.1}s) done",
+                        i + 1,
+                        chunks.len(),
+                        (end - start) as f64 / SAMPLE_RATE as f64
+                    );
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        parts.push(text.to_string());
+                    }
+                }
+                Ok(parts.join(" "))
+            }));
 
             match transcribe_result {
                 Ok(inner_result) => {
@@ -779,12 +815,12 @@ impl TranscriptionManager {
 
         let corrected_result = if !settings.custom_words.is_empty() && !is_whisper {
             apply_custom_words(
-                &result.text,
+                &result,
                 &settings.custom_words,
                 settings.word_correction_threshold,
             )
         } else {
-            result.text
+            result
         };
 
         // Filter out filler words and hallucinations
@@ -829,6 +865,91 @@ impl TranscriptionManager {
         self.maybe_unload_immediately("transcription");
 
         Ok(final_result)
+    }
+}
+
+const SAMPLE_RATE: usize = 16_000;
+/// Takes up to this long go to the engine whole, exactly as before.
+const CHUNK_ABOVE_SAMPLES: usize = 120 * SAMPLE_RATE;
+/// Longer takes are cut into chunks of at most this length...
+const CHUNK_MAX_SAMPLES: usize = 60 * SAMPLE_RATE;
+/// ...each ending at the quietest 30 ms frame in its last 15 s, so a cut
+/// lands between words rather than through one.
+const CHUNK_SEARCH_SAMPLES: usize = 15 * SAMPLE_RATE;
+const CHUNK_FRAME: usize = 480;
+
+/// Sample ranges to feed the engine one at a time. A take at or under
+/// `CHUNK_ABOVE_SAMPLES` comes back as one range covering all of it.
+fn split_for_engine(audio: &[f32]) -> Vec<(usize, usize)> {
+    if audio.len() <= CHUNK_ABOVE_SAMPLES {
+        return vec![(0, audio.len())];
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    while audio.len() - start > CHUNK_MAX_SAMPLES {
+        let window_end = start + CHUNK_MAX_SAMPLES;
+        let mut best = window_end;
+        let mut best_energy = f32::MAX;
+        let mut frame_start = window_end - CHUNK_SEARCH_SAMPLES;
+        while frame_start + CHUNK_FRAME <= window_end {
+            let energy: f32 = audio[frame_start..frame_start + CHUNK_FRAME]
+                .iter()
+                .map(|s| s * s)
+                .sum();
+            if energy < best_energy {
+                best_energy = energy;
+                best = frame_start + CHUNK_FRAME / 2;
+            }
+            frame_start += CHUNK_FRAME;
+        }
+        ranges.push((start, best));
+        start = best;
+    }
+    ranges.push((start, audio.len()));
+    ranges
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::*;
+
+    #[test]
+    fn short_take_is_one_untouched_range() {
+        let audio = vec![0.1f32; CHUNK_ABOVE_SAMPLES];
+        assert_eq!(split_for_engine(&audio), vec![(0, CHUNK_ABOVE_SAMPLES)]);
+        assert_eq!(split_for_engine(&[]), vec![(0, 0)]);
+    }
+
+    /// Ranges must tile the take exactly: a gap drops words, an overlap
+    /// repeats them.
+    #[test]
+    fn long_take_is_tiled_without_gaps_or_overlaps() {
+        let audio = vec![0.2f32; 7 * 60 * SAMPLE_RATE + 1234];
+        let ranges = split_for_engine(&audio);
+        assert!(ranges.len() >= 7);
+        assert_eq!(ranges[0].0, 0);
+        assert_eq!(ranges.last().unwrap().1, audio.len());
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0);
+        }
+        for &(s, e) in &ranges {
+            assert!(e > s && e - s <= CHUNK_MAX_SAMPLES);
+        }
+    }
+
+    #[test]
+    fn cut_lands_in_the_pause() {
+        let mut audio = vec![0.3f32; 3 * 60 * SAMPLE_RATE];
+        // A half-second pause 52 s in: the first cut belongs inside it.
+        let pause = 52 * SAMPLE_RATE;
+        for s in &mut audio[pause..pause + SAMPLE_RATE / 2] {
+            *s = 0.0;
+        }
+        let cut = split_for_engine(&audio)[0].1;
+        assert!(
+            cut >= pause && cut <= pause + SAMPLE_RATE / 2,
+            "cut at {cut}"
+        );
     }
 }
 
